@@ -1,6 +1,7 @@
 // tts-worker.js - runs the Kokoro voice model off the main thread.
 // Messages in:  {type:'load', engine:'auto'|'gpu'|'cpu'} | {type:'synth', id, text, voice, speed}
-// Messages out: {type:'progress', loaded, total} | {type:'ready', engine, threads}
+// Messages out: {type:'engine', engine} | {type:'cached', cached} | {type:'progress', loaded, total}
+//               {type:'ready', engine, threads}
 //               {type:'audio', id, data(Float32Array) | error} | {type:'error', message}
 //
 // Engines:
@@ -39,6 +40,13 @@ async function gpuAvailable() {
 
 async function load(engine) {
   files.clear();
+  self.postMessage({ type: 'engine', engine });            // lets the page notice if loading crashes it
+  try {                                                     // already stored on this device?
+    const c = await caches.open('transformers-cache');
+    const file = engine === 'gpu' ? 'model.onnx' : 'model_quantized.onnx';
+    const hit = await c.match(`https://huggingface.co/${MODEL_ID}/resolve/main/onnx/${file}`);
+    self.postMessage({ type: 'cached', cached: !!hit });
+  } catch { /* no cache storage */ }
   return KokoroTTS.from_pretrained(MODEL_ID, engine === 'gpu'
     ? { dtype: 'fp32', device: 'webgpu', progress_callback: reportProgress }
     : { dtype: 'q8', device: 'wasm', progress_callback: reportProgress });

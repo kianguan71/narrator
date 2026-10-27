@@ -39,7 +39,7 @@
       <p>Listen to PDF and EPUB files, read aloud by natural AI voices that run right here on your device.</p>
       <button id="btnOpenBig" class="primary">Open a PDF or EPUB</button>
       <div id="recentBox" class="recent"></div>
-      <p id="voiceNote" class="note">The first time, the voices are downloaded (about 330&nbsp;MB, or 90&nbsp;MB in compact mode) and kept on this device. Wi-Fi recommended.</p>
+      <p id="voiceNote" class="note">On computers, the AI voices are downloaded the first time (about 330&nbsp;MB) and kept on the device. Wi-Fi recommended.</p>
     </div>
     <article id="text" class="text" hidden></article>
   </main>
@@ -104,9 +104,10 @@
       <section>
         <h4>Voice engine</h4>
         <div class="seg" id="segEngine">
-          <button data-v="auto">Automatic</button><button data-v="gpu">Fast</button><button data-v="cpu">Compact</button>
+          <button data-v="auto">Automatic</button><button data-v="gpu">Fast</button><button data-v="cpu">Compact</button><button data-v="system">Built-in</button>
         </div>
-        <p class="small" style="color:var(--muted);margin:4px 0 0">Fast uses the graphics chip: smooth, about 330&nbsp;MB to download once. Compact uses the processor: about 90&nbsp;MB, but may pause between sentences on phones. Automatic picks Fast when the device supports it.</p>
+        <p class="small" style="color:var(--muted);margin:4px 0 0"><b>Fast</b> runs the AI voices on the graphics chip: smooth on computers, about 330&nbsp;MB to download once, but too big for iPhone/iPad. <b>Compact</b> runs them on the processor: about 90&nbsp;MB, but pauses between sentences on most devices. <b>Built-in</b> uses the voices that come with this device: nothing to download and never pauses. <b>Automatic</b> picks Built-in on iPhone/iPad and Fast on computers that support it.</p>
+        <p class="small" style="color:var(--muted);margin:6px 0 0">Tip for iPhone/iPad: for a more natural built-in voice, open Settings › Accessibility › Spoken Content › Voices › English, download an <i>Enhanced</i> or <i>Premium</i> voice (e.g. Ava, Zoe, Evan, Nathan), then reopen Narrator.</p>
       </section>
       <section>
         <h4>Speed</h4>

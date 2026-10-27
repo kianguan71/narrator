@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.1';
+const VERSION = '1.2';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -9,9 +9,12 @@ const VOICES = {
   'female-uk': ['bf_emma', 'Emma (British)'], 'male-uk': ['bm_george', 'George (British)'],
 };
 const KEEP_BEHIND = 8;
-let engine = '';                                   // 'gpu' (fast) or 'cpu' (compact), set when voices load
+let engine = '';   // 'gpu' (fast), 'cpu' (compact) or 'system' (the device's built-in voices), set when voices load
 const lookahead = () => engine === 'gpu' ? 6 : 14;  // read further ahead when synthesis is slow
 const MOCK = new URLSearchParams(location.search).has('mock');   // testing without the voice model
+// iPhone / iPad (iPadOS reports itself as a Mac, but has a touch screen)
+const APPLE_MOBILE = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+const HAS_SPEECH = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 const $ = id => document.getElementById(id);
 
 // ------------------------------------------------------------------ storage
@@ -87,8 +90,42 @@ function wsola(x, stretch, frame = 1024, hop = 256, tol = 256) {
 }
 
 // ------------------------------------------------------------------ voice worker
-let worker, ttsReady = false, ttsError = null, dl = { loaded: 0, total: 0 }, threads = false;
+let worker, ttsReady = false, ttsError = null, dl = { loaded: 0, total: 0 }, threads = false, dlCached = false, loadingEngine = '';
+
+// Which engine to start. On iPhone/iPad the AI voice engines are too heavy for the browser
+// (the fast one runs out of memory, the compact one is slower than speech), so Automatic
+// uses the device's own voices there.
+function resolveEngine() {
+  const v = S.engine;
+  if (v === 'system') return HAS_SPEECH ? 'system' : 'cpu';
+  if (v === 'gpu') return 'gpu';
+  if (v === 'cpu') return 'cpu';
+  if (APPLE_MOBILE) return HAS_SPEECH ? 'system' : 'cpu';
+  if (localStorage.getItem('narrator.gpuFailed') === '1') return 'cpu';
+  return 'auto';                       // the worker picks gpu when available, otherwise cpu
+}
+
+// Crash guard: if the page died while a voice engine was loading or playing, don't try it again.
+let crashNote = '';
+(function checkLastRun() {
+  const loading = localStorage.getItem('narrator.loading');
+  const active = localStorage.getItem('narrator.active');
+  localStorage.removeItem('narrator.loading'); localStorage.removeItem('narrator.active');
+  const died = loading || active;
+  if (!died || died === 'system') return;
+  if (died === 'gpu') {
+    localStorage.setItem('narrator.gpuFailed', '1');
+    if (S.engine === 'gpu') { S.engine = 'auto'; saveSettings(); }
+  } else if (died === 'cpu' && APPLE_MOBILE && HAS_SPEECH && S.engine === 'cpu') { S.engine = 'system'; saveSettings(); }
+  else return;
+  crashNote = died === 'gpu'
+    ? 'The fast voice engine ran out of memory last time, so a lighter engine is used now.'
+    : 'The compact voice engine ran out of memory last time, so the built-in voices are used now.';
+})();
+
 function startWorker() {
+  const r = resolveEngine();
+  if (r === 'system' && !MOCK) { startSystem(); return; }
   if (MOCK) {
     worker = {
       postMessage(m) {
@@ -110,15 +147,19 @@ function startWorker() {
     worker.onmessage = onWorker;
     worker.onerror = e => { ttsError = e.message || 'The voice engine could not start.'; updateStatus(); };
   }
-  worker.postMessage({ type: 'load', engine: S.engine });
+  worker.postMessage({ type: 'load', engine: r });
 }
 function onWorker(e) {
   const m = e.data;
   if (m.type === 'progress') { dl = m; updateStatus(); }
+  else if (m.type === 'engine') { loadingEngine = m.engine; markActive(); }
+  else if (m.type === 'cached') { dlCached = m.cached; updateStatus(); }
   else if (m.type === 'ready') {
+    loadingEngine = ''; try { localStorage.removeItem('narrator.loading'); } catch { /* ignore */ }
     ttsReady = true; threads = m.threads; engine = m.engine || 'cpu'; updateStatus(); pump();
     $('voiceNote').hidden = true;
   } else if (m.type === 'error') {
+    loadingEngine = ''; try { localStorage.removeItem('narrator.loading'); } catch { /* ignore */ }
     const network = /fetch|network|load failed|offline|internet/i.test(m.message || '');
     if (!network && self.crossOriginIsolated && localStorage.getItem('narrator.noThreads') !== '1') {
       // fall back to single-threaded mode once, which works everywhere
@@ -128,6 +169,124 @@ function onWorker(e) {
     }
     ttsError = network ? 'no internet connection - tap here to try again' : m.message; updateStatus();
   } else if (m.type === 'audio') onAudio(m);
+}
+
+// ------------------------------------------------------------------ built-in (device) voices
+// Uses the speech voices that come with the device (on iPhone/iPad: Settings > Accessibility >
+// Spoken Content > Voices). Nothing to download and no heavy processing, so it never pauses.
+const FEMALE_RE = /samantha|ava|allison|susan|zoe|nicky|joelle|noelle|kate|serena|stephanie|martha|karen|moira|tessa|fiona|victoria|veena|catherine|kathy|vicki|shelley|sandy|flo|grandma|zira|aria|jenny|libby|sonia|hazel|emma|olivia|female|woman/i;
+const MALE_RE = /alex|\btom\b|aaron|evan|nathan|fred|daniel|arthur|oliver|rishi|gordon|\blee\b|reed|eddy|rocko|ralph|grandpa|david|\bmark\b|\bguy\b|ryan|thomas|george|james|christopher|eric|roger|brian|male|\bman\b/i;
+const NOVELTY_RE = /bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|junior|ralph|princess|deranged|hysterical/i;
+const ELOQUENCE_RE = /\b(eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley)\b/i;
+let sysVoice = null;
+const SV = { gen: 0, queued: -1, frac: 0, startChar: 0, tStart: 0, lastEvent: 0 };
+
+function sysVoices() { try { return speechSynthesis.getVoices().filter(v => /^en([-_]|$)/i.test(v.lang)); } catch { return []; } }
+function sysQuality(v) {
+  const id = `${v.voiceURI} ${v.name}`;
+  if (NOVELTY_RE.test(v.name)) return -2;
+  if (ELOQUENCE_RE.test(v.name)) return 0;
+  if (/premium|natural|neural/i.test(id)) return 3;
+  if (/enhanced|google/i.test(id)) return 2;
+  return 1;
+}
+function sysGender(v) { return FEMALE_RE.test(v.name) ? 'female' : MALE_RE.test(v.name) ? 'male' : ''; }
+function sysPick() {
+  const list = sysVoices();
+  const accent = S.accent === 'uk' ? /GB/i : /US/i;
+  let best = null, bestScore = -1e9;
+  for (const v of list) {
+    const g = sysGender(v);
+    // the chosen gender comes first, then voice quality, then accent
+    const score = (g === S.gender ? 40 : g ? 0 : 15) + sysQuality(v) * 10 + (accent.test(v.lang) ? 3 : 0) + (v.localService ? 0.5 : 0);
+    if (score > bestScore) { bestScore = score; best = v; }
+  }
+  sysVoice = best;
+  return best;
+}
+const sysName = () => sysVoice ? sysVoice.name.replace(/\s*\((English|United States|United Kingdom)[^)]*\)/i, '').trim() : 'device voice';
+
+async function startSystem() {
+  engine = 'system'; dl = { loaded: 0, total: 0 };
+  let list = sysVoices();
+  for (let i = 0; !list.length && i < 30; i++) {           // voices arrive a moment after start-up
+    await new Promise(r => setTimeout(r, 100)); list = sysVoices();
+  }
+  if (!list.length) {                                       // no voices: use the compact AI engine instead
+    if (S.engine === 'system') { ttsError = 'this device has no built-in English voices'; updateStatus(); return; }
+    S.engine = 'cpu'; saveSettings(); syncControls(); startWorker(); return;
+  }
+  sysPick();
+  try { speechSynthesis.onvoiceschanged = () => { if (engine === 'system') sysPick(); }; } catch { /* ignore */ }
+  ttsReady = true; threads = false; ttsError = null;
+  $('voiceNote').hidden = true;
+  updateStatus();
+}
+function sysStop() {
+  SV.gen++; SV.queued = -1;
+  try { speechSynthesis.cancel(); } catch { /* ignore */ }
+}
+function sysSpeakFrom(i, frac) {
+  sysStop();
+  SV.frac = frac; SV.lastEvent = Date.now();
+  sysEnqueue(i, frac);
+}
+function sysEnqueue(i, frac = 0) {
+  const b = E.book, n = b.chunks.length;
+  while (i < n && !/[A-Za-z0-9]/.test(b.chunks[i].text)) i++;   // nothing to say: skip
+  if (i >= n) return;
+  const g = SV.gen, full = b.chunks[i].text;
+  let start = 0;
+  if (frac > 0) {
+    start = Math.floor(frac * full.length);
+    const sp = full.lastIndexOf(' ', start);
+    start = sp > 0 ? sp + 1 : 0;
+  }
+  const u = new SpeechSynthesisUtterance(full.slice(start));
+  if (sysVoice) { u.voice = sysVoice; u.lang = sysVoice.lang; } else u.lang = S.accent === 'uk' ? 'en-GB' : 'en-US';
+  u.rate = S.speed; u.volume = S.volume / 100;
+  u.onstart = () => {
+    if (g !== SV.gen) return;
+    SV.lastEvent = Date.now(); SV.tStart = Date.now(); SV.startChar = start;
+    if (E.cur !== i) { E.cur = i; refreshHighlight(); }
+    SV.frac = start / full.length;
+    if (SV.queued <= i && i + 1 < n) sysEnqueue(i + 1);         // keep the next sentence queued: no gap
+  };
+  u.onboundary = ev => {
+    if (g !== SV.gen || E.cur !== i) return;
+    SV.lastEvent = Date.now();
+    SV.frac = clamp((start + (ev.charIndex || 0)) / full.length, 0, 0.999);
+  };
+  const done = ev => {
+    if (g !== SV.gen) return;
+    if (ev && ev.type === 'error' && /interrupted|canceled/.test(ev.error)) return;
+    SV.lastEvent = Date.now();
+    if (start === 0 && full.length > 40 && SV.tStart) {        // learn how fast this voice speaks (for the timeline)
+      const secs = (Date.now() - SV.tStart) / 1000;
+      const observed = chunkWeight(b.chunks[i]) / (secs * S.speed);
+      if (isFinite(observed) && observed > 3 && observed < 40) E.cps = 0.9 * E.cps + 0.1 * observed;
+    }
+    if (E.cur === i) SV.frac = 0.999;
+    if (SV.queued <= i) {                                        // nothing else queued
+      if (i + 1 >= n) { E.playing = false; E.finished = true; onPlayState(); flash('Finished.'); }
+      else sysEnqueue(i + 1);
+    }
+  };
+  u.onend = done; u.onerror = done;
+  SV.queued = i;
+  speechSynthesis.speak(u);
+}
+// iOS sometimes stops speaking after an interruption (a call, Siri, another app's audio): restart.
+function sysWatchdog() {
+  if (engine !== 'system' || !E.playing || !E.book) return;
+  let busy = false;
+  try { busy = speechSynthesis.speaking || speechSynthesis.pending; } catch { /* ignore */ }
+  if (!busy && Date.now() - SV.lastEvent > 2500) {
+    if (SV.frac < 0.99) sysSpeakFrom(E.cur, SV.frac);
+    else if (E.cur + 1 < E.book.chunks.length) { E.cur++; SV.frac = 0; refreshHighlight(); sysSpeakFrom(E.cur, 0); }
+    else { E.playing = false; E.finished = true; onPlayState(); }
+  }
+  else if (busy && speechSynthesis.paused) { try { speechSynthesis.resume(); } catch { /* ignore */ } }
 }
 
 // ------------------------------------------------------------------ engine
@@ -140,7 +299,7 @@ let reqId = 0;
 const ckey = i => `${i}|${voiceId()}|${S.speed}`;
 
 function pump() {
-  if (!ttsReady || !E.book || E.inflight) return;
+  if (!ttsReady || !E.book || E.inflight || engine === 'system') return;
   const n = E.book.chunks.length;
   for (let i = E.cur; i < Math.min(n, E.cur + lookahead()); i++) {
     const k = ckey(i);
@@ -198,9 +357,18 @@ function ensureAudio() {
   if (E.ctx.state !== 'running') E.ctx.resume().catch(() => {});
 }
 function stopSource() {
+  if (engine === 'system') { sysStop(); return; }
   if (E.src) { const s = E.src; E.src = null; s.onended = null; try { s.stop(); } catch { /* already stopped */ } }
 }
 function startSource() {
+  if (engine === 'system') {
+    if (!ttsReady) { E.buffering = true; updateStatus(); return; }
+    E.buffering = false; E.preroll = false;
+    const f = E.pendingFrac != null ? E.pendingFrac : SV.frac;
+    E.pendingFrac = null;
+    sysSpeakFrom(E.cur, f >= 0.99 ? 0 : f);
+    return;
+  }
   const a = E.cache.get(ckey(E.cur));
   const n = E.book.chunks.length;
   const needNext = E.preroll && engine !== 'gpu' && E.cur + 1 < n && !E.cache.has(ckey(E.cur + 1));
@@ -230,20 +398,22 @@ function advance() {
 const curOffset = () => (E.src && E.playing) ? Math.max(0, E.ctx.currentTime - E.startedAt) : E.offset;
 function curFrac() {
   if (E.pendingFrac != null) return E.pendingFrac;
+  if (engine === 'system') return SV.frac;
   const a = E.cache.get(ckey(E.cur));
   return a && a.length ? clamp(curOffset() / (a.length / SR), 0, 1) : 0;
 }
 
 function play() {
   if (!E.book) { openPicker(); return; }
-  ensureAudio();
-  if (E.finished) { E.cur = 0; E.offset = 0; E.pendingFrac = 0; E.finished = false; }
+  if (engine !== 'system') ensureAudio();
+  if (E.finished) { E.cur = 0; E.offset = 0; E.pendingFrac = 0; E.finished = false; SV.frac = 0; }
   E.playing = true; E.preroll = true;
   startSource();
   onPlayState();
 }
 function pause() {
-  E.offset = curOffset(); E.pendingFrac = null;
+  if (engine === 'system') E.pendingFrac = curFrac();
+  else { E.offset = curOffset(); E.pendingFrac = null; }
   stopSource(); E.playing = false; E.buffering = false;
   onPlayState(); savePosition(true);
 }
@@ -257,6 +427,7 @@ function seek(i, frac = 0) {
   refreshHighlight(true); updateTimes();
 }
 function reVoice() {          // voice or speed changed: keep the place
+  if (engine === 'system') sysPick();
   const frac = curFrac();
   stopSource(); E.offset = 0; E.pendingFrac = frac;
   if (E.playing) startSource(); else pump();
@@ -508,16 +679,20 @@ function updateStatus() {
   if (Date.now() < flashUntil) s = flashMsg;
   else if (ttsError) s = '⚠ Voices could not load: ' + ttsError;
   else if (!ttsReady) {
-    s = dl.total ? `Downloading voices ${Math.round(100 * dl.loaded / dl.total)}% (${Math.round(dl.loaded / 1e6)} of ${Math.round(dl.total / 1e6)} MB)` : 'Preparing voices…';
+    const pct = dl.total ? Math.round(100 * dl.loaded / dl.total) : 0;
+    s = !dl.total ? 'Preparing voices…'
+      : dlCached ? `Loading voices stored on this device ${pct}%`
+      : `Downloading voices ${pct}% (${Math.round(dl.loaded / 1e6)} of ${Math.round(dl.total / 1e6)} MB)`;
   } else if (E.buffering && E.playing) s = 'Preparing audio…';
   else if (!E.book) s = 'Ready — open a book';
-  else s = `${E.playing ? 'Playing' : 'Paused'} · ${voiceLabel().split(' ')[0]}${sleep.until ? ' · sleep ' + fmt((sleep.until - Date.now()) / 1000) : sleep.chapter != null ? ' · sleep at chapter end' : ''}`;
+  else s = `${E.playing ? 'Playing' : 'Paused'} · ${engine === 'system' ? sysName() : voiceLabel().split(' ')[0]}${sleep.until ? ' · sleep ' + fmt((sleep.until - Date.now()) / 1000) : sleep.chapter != null ? ' · sleep at chapter end' : ''}`;
   $('status').textContent = s;
 }
 function onPlayState() {
   $('icoPlay').hidden = E.playing; $('icoPause').hidden = !E.playing;
   $('bPlay').setAttribute('aria-label', E.playing ? 'Pause' : 'Play');
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = E.playing ? 'playing' : 'paused';
+  markActive();
   wakeLock(); updateStatus();
 }
 function updateMedia() {
@@ -544,11 +719,26 @@ async function wakeLock() {
     } else if (lock) { await lock.release(); lock = null; }
   } catch { lock = null; }
 }
+// "active" flag for the crash guard: set while playing on screen, cleared whenever the page
+// is paused, hidden or closed normally. If it is still set at the next start, the page crashed.
+function markActive() {
+  const vis = document.visibilityState === 'visible';
+  try {
+    if (E.playing && engine && vis) localStorage.setItem('narrator.active', engine);
+    else localStorage.removeItem('narrator.active');
+    if (loadingEngine && !ttsReady && vis) localStorage.setItem('narrator.loading', loadingEngine);
+    else localStorage.removeItem('narrator.loading');
+  } catch { /* ignore */ }
+}
 document.addEventListener('visibilitychange', () => {
+  markActive();
   if (document.visibilityState === 'hidden') savePosition(true);
   else { wakeLock(); if (E.playing && E.ctx && E.ctx.state !== 'running') E.ctx.resume().catch(() => {}); }
 });
-window.addEventListener('pagehide', () => savePosition(true));
+window.addEventListener('pagehide', () => {
+  savePosition(true);
+  try { localStorage.removeItem('narrator.active'); localStorage.removeItem('narrator.loading'); } catch { /* ignore */ }
+});
 
 // ------------------------------------------------------------------ sleep timer
 const sleep = { until: 0, chapter: null };
@@ -626,13 +816,17 @@ for (const b of $('segEngine').children) b.onclick = () => setEngine(b.dataset.v
 function setEngine(v) {
   if (S.engine === v) return;
   S.engine = v; saveSettings(); syncControls();
+  if (v === 'gpu') localStorage.removeItem('narrator.gpuFailed');   // chosen on purpose: allow another try
   const wasPlaying = E.playing;
   if (E.playing) pause();
+  if (engine === 'system') sysStop();
   if (worker && worker.terminate) worker.terminate();
-  ttsReady = false; ttsError = null; engine = ''; dl = { loaded: 0, total: 0 };
+  worker = null;
+  ttsReady = false; ttsError = null; engine = ''; dl = { loaded: 0, total: 0 }; dlCached = false;
   E.cache.clear(); E.inflight = null; E.gen++;
   startWorker();
-  flash(v === 'cpu' ? 'Switching to the compact voice engine…' : 'Switching voice engine…');
+  flash(v === 'cpu' ? 'Switching to the compact voice engine…' : v === 'system' ? 'Switching to the built-in voices…' : 'Switching voice engine…');
+  if (v === 'gpu' && APPLE_MOBILE) setTimeout(() => flash('Fast may run out of memory on iPhone/iPad. If the app restarts, it switches back by itself.', 7000), 3600);
   if (wasPlaying) { const t = setInterval(() => { if (ttsReady) { clearInterval(t); play(); } }, 300); }
 }
 $('mReset').onclick = async () => {
@@ -643,7 +837,9 @@ $('mReset').onclick = async () => {
   location.reload();
 };
 function updateInfo() {
-  const eng = !ttsReady ? 'loading' : engine === 'gpu' ? 'fast (graphics chip)' : `compact (processor, ${threads ? 'multi-core' : 'single-core'})`;
+  const eng = !ttsReady ? 'loading' : engine === 'gpu' ? 'fast (graphics chip)'
+    : engine === 'system' ? `built-in voices (${sysVoice ? sysVoice.name : 'default'})`
+    : `compact (processor, ${threads ? 'multi-core' : 'single-core'})`;
   $('mInfo').textContent = `Version ${VERSION} · voice engine: ${eng}`;
 }
 
@@ -680,6 +876,8 @@ setTheme(S.theme); setFont(S.font); syncControls(); renderRecent();
 registerSW();
 try { navigator.storage?.persist?.(); } catch { /* ignore */ }
 startWorker();
+if (crashNote) setTimeout(() => flash(crashNote, 9000), 500);
+setInterval(sysWatchdog, 1000);
 setInterval(() => {
   if (E.book) {
     if (E.cur !== shownCur) refreshHighlight();

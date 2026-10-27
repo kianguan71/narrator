@@ -2,14 +2,15 @@
 // Every same-origin response is served with COOP/COEP headers, which lets the
 // voice engine use several CPU cores (GitHub Pages cannot set these headers itself).
 // Registered as "sw.js?coi=0" to turn the headers off (fallback for old browsers).
-const CACHE = 'narrator-v2';
+const CACHE = 'narrator-v3';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'doc.js', 'tts-worker.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
   'lib/kokoro.web.js', 'lib/pdf.min.mjs', 'lib/pdf.worker.min.mjs', 'lib/jszip.min.js'];
 const COI = new URL(self.location.href).searchParams.get('coi') !== '0';
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // cache: 'reload' skips the browser's own short-term cache, so a new version is stored straight away
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys()
@@ -33,7 +34,13 @@ self.addEventListener('fetch', e => {
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
     const fromCache = () => cache.match(req, { ignoreSearch: url.pathname.endsWith('/') || url.pathname.endsWith('.html') });
-    const fromNet = () => fetch(req).then(r => {
+    // app files are re-checked with the server every time (cheap: unchanged files are not re-sent)
+    let netReq = req;
+    if (!isLib) {
+      try { netReq = req.mode === 'navigate' ? new Request(req.url, { cache: 'no-cache' }) : new Request(req, { cache: 'no-cache' }); }
+      catch { netReq = req; }
+    }
+    const fromNet = () => fetch(netReq).then(r => {
       if (r && r.ok && r.type === 'basic') cache.put(req, r.clone());
       return r;
     });
