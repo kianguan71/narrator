@@ -1,14 +1,16 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.0';
+const VERSION = '1.1';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
   'female-us': ['af_heart', 'Heart (American)'], 'male-us': ['am_michael', 'Michael (American)'],
   'female-uk': ['bf_emma', 'Emma (British)'], 'male-uk': ['bm_george', 'George (British)'],
 };
-const LOOKAHEAD = 5, KEEP_BEHIND = 8;
+const KEEP_BEHIND = 8;
+let engine = '';                                   // 'gpu' (fast) or 'cpu' (compact), set when voices load
+const lookahead = () => engine === 'gpu' ? 6 : 14;  // read further ahead when synthesis is slow
 const MOCK = new URLSearchParams(location.search).has('mock');   // testing without the voice model
 const $ = id => document.getElementById(id);
 
@@ -16,7 +18,7 @@ const $ = id => document.getElementById(id);
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* full or blocked */ } };
 const S = Object.assign({ gender: 'female', accent: 'us', speed: 1, font: 18, theme: 'auto',
-  keepAwake: true, follow: true, volume: 100 }, load('narrator.settings', {}));
+  keepAwake: true, follow: true, volume: 100, engine: 'auto' }, load('narrator.settings', {}));
 const saveSettings = () => save('narrator.settings', S);
 let positions = load('narrator.positions', {});
 let bookmarks = load('narrator.bookmarks', {});
@@ -108,13 +110,13 @@ function startWorker() {
     worker.onmessage = onWorker;
     worker.onerror = e => { ttsError = e.message || 'The voice engine could not start.'; updateStatus(); };
   }
-  worker.postMessage({ type: 'load' });
+  worker.postMessage({ type: 'load', engine: S.engine });
 }
 function onWorker(e) {
   const m = e.data;
   if (m.type === 'progress') { dl = m; updateStatus(); }
   else if (m.type === 'ready') {
-    ttsReady = true; threads = m.threads; updateStatus(); pump();
+    ttsReady = true; threads = m.threads; engine = m.engine || 'cpu'; updateStatus(); pump();
     $('voiceNote').hidden = true;
   } else if (m.type === 'error') {
     const network = /fetch|network|load failed|offline|internet/i.test(m.message || '');
@@ -140,7 +142,7 @@ const ckey = i => `${i}|${voiceId()}|${S.speed}`;
 function pump() {
   if (!ttsReady || !E.book || E.inflight) return;
   const n = E.book.chunks.length;
-  for (let i = E.cur; i < Math.min(n, E.cur + LOOKAHEAD); i++) {
+  for (let i = E.cur; i < Math.min(n, E.cur + lookahead()); i++) {
     const k = ckey(i);
     if (!E.cache.has(k)) { request(i, k); return; }
   }
@@ -169,12 +171,12 @@ function onAudio(m) {
     const out = new Float32Array(a.length + Math.floor(SR * pause));
     out.set(a, 0);
     E.cache.set(f.k, out);
-    if (f.i === E.cur && E.playing && !E.src) startSource();
+    if ((f.i === E.cur || f.i === E.cur + 1) && E.playing && !E.src) startSource();
   }
   pump();
 }
 function evict() {
-  const lo = E.cur - KEEP_BEHIND, hi = E.cur + LOOKAHEAD + 3, v = voiceId(), s = String(S.speed);
+  const lo = E.cur - KEEP_BEHIND, hi = E.cur + lookahead() + 3, v = voiceId(), s = String(S.speed);
   for (const k of [...E.cache.keys()]) {
     const [i, kv, ks] = k.split('|');
     if (+i < lo || +i > hi || kv !== v || ks !== s) E.cache.delete(k);
@@ -200,8 +202,10 @@ function stopSource() {
 }
 function startSource() {
   const a = E.cache.get(ckey(E.cur));
-  if (!a) { E.buffering = true; pump(); updateStatus(); return; }
-  E.buffering = false;
+  const n = E.book.chunks.length;
+  const needNext = E.preroll && engine !== 'gpu' && E.cur + 1 < n && !E.cache.has(ckey(E.cur + 1));
+  if (!a || needNext) { E.buffering = true; pump(); updateStatus(); return; }
+  E.buffering = false; E.preroll = false;
   E.dur = a.length / SR;
   if (E.pendingFrac != null) { E.offset = E.pendingFrac * E.dur; E.pendingFrac = null; }
   if (E.offset >= E.dur - 0.02) { advance(); return; }
@@ -234,7 +238,7 @@ function play() {
   if (!E.book) { openPicker(); return; }
   ensureAudio();
   if (E.finished) { E.cur = 0; E.offset = 0; E.pendingFrac = 0; E.finished = false; }
-  E.playing = true;
+  E.playing = true; E.preroll = true;
   startSource();
   onPlayState();
 }
@@ -248,6 +252,7 @@ function seek(i, frac = 0) {
   if (!E.book) return;
   stopSource();
   E.cur = clamp(i, 0, E.book.chunks.length - 1); E.offset = 0; E.pendingFrac = clamp(frac, 0, 0.999); E.finished = false;
+  E.preroll = true;
   if (E.playing) startSource(); else pump();
   refreshHighlight(true); updateTimes();
 }
@@ -599,6 +604,7 @@ function syncControls() {
   const mark = (box, v) => { for (const b of box.children) b.classList.toggle('on', b.dataset.v === String(v)); };
   mark($('segSpeed'), S.speed); mark($('segSpeed2'), S.speed);
   mark($('segGender'), S.gender); mark($('segAccent'), S.accent); mark($('segTheme'), S.theme);
+  mark($('segEngine'), S.engine);
   $('bSpeed').textContent = speedLabel(S.speed);
   $('bVoice').textContent = S.gender === 'female' ? '♀ Female' : '♂ Male';
   $('mFollow').checked = S.follow; $('mAwake').checked = S.keepAwake; $('mVolume').value = S.volume;
@@ -616,6 +622,19 @@ $('mLarger').onclick = () => setFont(S.font + 1);
 $('mFollow').onchange = () => { S.follow = $('mFollow').checked; saveSettings(); };
 $('mAwake').onchange = () => { S.keepAwake = $('mAwake').checked; saveSettings(); wakeLock(); };
 $('mVolume').oninput = () => { S.volume = +$('mVolume').value; saveSettings(); if (E.gain) E.gain.gain.value = S.volume / 100; };
+for (const b of $('segEngine').children) b.onclick = () => setEngine(b.dataset.v);
+function setEngine(v) {
+  if (S.engine === v) return;
+  S.engine = v; saveSettings(); syncControls();
+  const wasPlaying = E.playing;
+  if (E.playing) pause();
+  if (worker && worker.terminate) worker.terminate();
+  ttsReady = false; ttsError = null; engine = ''; dl = { loaded: 0, total: 0 };
+  E.cache.clear(); E.inflight = null; E.gen++;
+  startWorker();
+  flash(v === 'cpu' ? 'Switching to the compact voice engine…' : 'Switching voice engine…');
+  if (wasPlaying) { const t = setInterval(() => { if (ttsReady) { clearInterval(t); play(); } }, 300); }
+}
 $('mReset').onclick = async () => {
   if (!confirm('Remove the downloaded voices, stored books, reading positions and settings from this device?')) return;
   try { for (const k of await caches.keys()) await caches.delete(k); } catch { /* ignore */ }
@@ -624,7 +643,8 @@ $('mReset').onclick = async () => {
   location.reload();
 };
 function updateInfo() {
-  $('mInfo').textContent = `Version ${VERSION} · voice engine ${ttsReady ? 'ready' : 'loading'}${ttsReady ? (threads ? ' (multi-core)' : ' (single-core)') : ''}`;
+  const eng = !ttsReady ? 'loading' : engine === 'gpu' ? 'fast (graphics chip)' : `compact (processor, ${threads ? 'multi-core' : 'single-core'})`;
+  $('mInfo').textContent = `Version ${VERSION} · voice engine: ${eng}`;
 }
 
 document.addEventListener('keydown', e => {

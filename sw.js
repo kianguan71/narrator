@@ -2,7 +2,7 @@
 // Every same-origin response is served with COOP/COEP headers, which lets the
 // voice engine use several CPU cores (GitHub Pages cannot set these headers itself).
 // Registered as "sw.js?coi=0" to turn the headers off (fallback for old browsers).
-const CACHE = 'narrator-v1';
+const CACHE = 'narrator-v2';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'doc.js', 'tts-worker.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png',
   'lib/kokoro.web.js', 'lib/pdf.min.mjs', 'lib/pdf.worker.min.mjs', 'lib/jszip.min.js'];
@@ -29,15 +29,22 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   const url = new URL(req.url);
   if (req.method !== 'GET' || url.origin !== self.location.origin) return;   // voices etc.: browser default
+  const isLib = /\/(lib|icons)\//.test(url.pathname);
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const cached = await cache.match(req, { ignoreSearch: url.pathname.endsWith('/') || url.pathname.endsWith('.html') });
-    const network = fetch(req).then(r => {
+    const fromCache = () => cache.match(req, { ignoreSearch: url.pathname.endsWith('/') || url.pathname.endsWith('.html') });
+    const fromNet = () => fetch(req).then(r => {
       if (r && r.ok && r.type === 'basic') cache.put(req, r.clone());
       return r;
-    }).catch(() => null);
-    const resp = cached || await network;
-    if (cached) e.waitUntil(network);   // refresh in the background
+    });
+    let resp;
+    if (isLib) {
+      // large libraries never change between versions: stored copy first
+      resp = await fromCache() || await fromNet().catch(() => null);
+    } else {
+      // app files: newest version when online, stored copy when offline
+      resp = await fromNet().catch(() => null) || await fromCache();
+    }
     return withHeaders(resp || new Response('Offline', { status: 503 }));
   })());
 });

@@ -1,7 +1,13 @@
 // tts-worker.js - runs the Kokoro voice model off the main thread.
-// Messages in:  {type:'load'} | {type:'synth', id, text, voice, speed}
-// Messages out: {type:'progress', loaded, total} | {type:'ready', threads}
+// Messages in:  {type:'load', engine:'auto'|'gpu'|'cpu'} | {type:'synth', id, text, voice, speed}
+// Messages out: {type:'progress', loaded, total} | {type:'ready', engine, threads}
 //               {type:'audio', id, data(Float32Array) | error} | {type:'error', message}
+//
+// Engines:
+//   gpu - WebGPU (graphics chip), full-precision model (~330 MB, once). About 8-10x faster than
+//         real time on a typical PC, so speech never has to wait.
+//   cpu - WebAssembly (processor), compact 8-bit model (~90 MB). Close to real time on a fast PC,
+//         slower on phones, so it can pause between sentences.
 import { KokoroTTS, env } from './lib/kokoro.web.js';
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
@@ -23,16 +29,37 @@ function reportProgress(p) {
   }
 }
 
+async function gpuAvailable() {
+  try {
+    if (!self.navigator || !self.navigator.gpu) return false;
+    const adapter = await self.navigator.gpu.requestAdapter();
+    return !!adapter;
+  } catch { return false; }
+}
+
+async function load(engine) {
+  files.clear();
+  return KokoroTTS.from_pretrained(MODEL_ID, engine === 'gpu'
+    ? { dtype: 'fp32', device: 'webgpu', progress_callback: reportProgress }
+    : { dtype: 'q8', device: 'wasm', progress_callback: reportProgress });
+}
+
 self.onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'load') {
+    let engine = m.engine === 'cpu' ? 'cpu' : (await gpuAvailable() ? 'gpu' : 'cpu');
+    if (m.engine === 'gpu' && engine !== 'gpu') engine = 'cpu';
     try {
-      tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-        dtype: 'q8', device: 'wasm', progress_callback: reportProgress,
-      });
-      // warm up so the first real sentence starts quickly
-      await tts.generate('Ready.', { voice: 'af_heart', speed: 1 });
-      self.postMessage({ type: 'ready', threads: self.crossOriginIsolated === true });
+      try {
+        tts = await load(engine);
+        await tts.generate('Ready.', { voice: 'af_heart', speed: 1 });   // warm-up
+      } catch (err) {
+        if (engine !== 'gpu') throw err;
+        engine = 'cpu';                       // graphics chip failed: fall back to the processor
+        tts = await load('cpu');
+        await tts.generate('Ready.', { voice: 'af_heart', speed: 1 });
+      }
+      self.postMessage({ type: 'ready', engine, threads: self.crossOriginIsolated === true });
     } catch (err) {
       self.postMessage({ type: 'error', message: String(err && err.message || err) });
     }

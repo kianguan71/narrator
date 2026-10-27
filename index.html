@@ -39,7 +39,7 @@
       <p>Listen to PDF and EPUB files, read aloud by natural AI voices that run right here on your device.</p>
       <button id="btnOpenBig" class="primary">Open a PDF or EPUB</button>
       <div id="recentBox" class="recent"></div>
-      <p id="voiceNote" class="note">The first time, about 90&nbsp;MB of voice data is downloaded and kept on this device. Wi-Fi recommended.</p>
+      <p id="voiceNote" class="note">The first time, the voices are downloaded (about 330&nbsp;MB, or 90&nbsp;MB in compact mode) and kept on this device. Wi-Fi recommended.</p>
     </div>
     <article id="text" class="text" hidden></article>
   </main>
@@ -100,6 +100,13 @@
         <div class="seg" id="segAccent">
           <button data-v="us">American</button><button data-v="uk">British</button>
         </div>
+      </section>
+      <section>
+        <h4>Voice engine</h4>
+        <div class="seg" id="segEngine">
+          <button data-v="auto">Automatic</button><button data-v="gpu">Fast</button><button data-v="cpu">Compact</button>
+        </div>
+        <p class="small" style="color:var(--muted);margin:4px 0 0">Fast uses the graphics chip: smooth, about 330&nbsp;MB to download once. Compact uses the processor: about 90&nbsp;MB, but may pause between sentences on phones. Automatic picks Fast when the device supports it.</p>
       </section>
       <section>
         <h4>Speed</h4>
