@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.2';
+const VERSION = '1.2.1';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -403,9 +403,40 @@ function curFrac() {
   return a && a.length ? clamp(curOffset() / (a.length / SR), 0, 1) : 0;
 }
 
+// iPhone/iPad mute the built-in speech voices when the phone is in Silent mode. Declaring the
+// page a "playback" app and keeping a silent sound playing makes iOS treat the narration like
+// music or a podcast: audible in Silent mode, and controllable from the lock screen.
+let keepAlive = null;
+function silentWavUrl() {
+  const sr = 8000, n = sr;                         // 1 second of 8-bit silence
+  const b = new Uint8Array(44 + n), v = new DataView(b.buffer);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) b[o + i] = s.charCodeAt(i); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVEfmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true); v.setUint32(28, sr, true);
+  v.setUint16(32, 1, true); v.setUint16(34, 8, true); str(36, 'data'); v.setUint32(40, n, true);
+  b.fill(128, 44);                                 // 128 = silence for 8-bit audio
+  return URL.createObjectURL(new Blob([b], { type: 'audio/wav' }));
+}
+function playbackSession(on) {
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { /* older iOS */ }
+  if (!APPLE_MOBILE || engine !== 'system') return;
+  try {
+    if (on) {
+      if (!keepAlive) {
+        keepAlive = document.createElement('audio');
+        keepAlive.src = silentWavUrl(); keepAlive.loop = true;
+        keepAlive.setAttribute('playsinline', ''); keepAlive.setAttribute('webkit-playsinline', '');
+        document.body.appendChild(keepAlive);
+      }
+      keepAlive.play().catch(() => {});
+    } else if (keepAlive) keepAlive.pause();
+  } catch { /* ignore */ }
+}
+
 function play() {
   if (!E.book) { openPicker(); return; }
   if (engine !== 'system') ensureAudio();
+  else playbackSession(true);                      // must happen inside the tap, before speaking
   if (E.finished) { E.cur = 0; E.offset = 0; E.pendingFrac = 0; E.finished = false; SV.frac = 0; }
   E.playing = true; E.preroll = true;
   startSource();
@@ -693,6 +724,7 @@ function onPlayState() {
   $('bPlay').setAttribute('aria-label', E.playing ? 'Pause' : 'Play');
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = E.playing ? 'playing' : 'paused';
   markActive();
+  if (!E.playing) playbackSession(false);
   wakeLock(); updateStatus();
 }
 function updateMedia() {
