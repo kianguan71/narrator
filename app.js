@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -21,7 +21,7 @@ const $ = id => document.getElementById(id);
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* full or blocked */ } };
 const S = Object.assign({ gender: 'female', accent: 'us', speed: 1, font: 18, theme: 'auto',
-  keepAwake: true, follow: true, volume: 100, engine: 'auto' }, load('narrator.settings', {}));
+  keepAwake: true, follow: true, volume: 100, engine: 'auto', sysVoiceURI: '' }, load('narrator.settings', {}));
 const saveSettings = () => save('narrator.settings', S);
 let positions = load('narrator.positions', {});
 let bookmarks = load('narrator.bookmarks', {});
@@ -177,7 +177,8 @@ function onWorker(e) {
 const FEMALE_RE = /samantha|ava|allison|susan|zoe|nicky|joelle|noelle|kate|serena|stephanie|martha|karen|moira|tessa|fiona|victoria|veena|catherine|kathy|vicki|shelley|sandy|flo|grandma|zira|aria|jenny|libby|sonia|hazel|emma|olivia|female|woman/i;
 const MALE_RE = /alex|\btom\b|aaron|evan|nathan|fred|daniel|arthur|oliver|rishi|gordon|\blee\b|reed|eddy|rocko|ralph|grandpa|david|\bmark\b|\bguy\b|ryan|thomas|george|james|christopher|eric|roger|brian|male|\bman\b/i;
 const NOVELTY_RE = /bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|junior|ralph|princess|deranged|hysterical/i;
-const ELOQUENCE_RE = /\b(eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley)\b/i;
+// older, robotic-sounding voices: used only when nothing better is available
+const ELOQUENCE_RE = /\b(eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley|fred|kathy)\b/i;
 let sysVoice = null;
 const SV = { gen: 0, queued: -1, frac: 0, startChar: 0, tStart: 0, lastEvent: 0 };
 
@@ -193,6 +194,10 @@ function sysQuality(v) {
 function sysGender(v) { return FEMALE_RE.test(v.name) ? 'female' : MALE_RE.test(v.name) ? 'male' : ''; }
 function sysPick() {
   const list = sysVoices();
+  if (S.sysVoiceURI) {                                   // a voice chosen in the menu
+    const v = list.find(x => x.voiceURI === S.sysVoiceURI);
+    if (v) { sysVoice = v; return v; }
+  }
   const accent = S.accent === 'uk' ? /GB/i : /US/i;
   let best = null, bestScore = -1e9;
   for (const v of list) {
@@ -309,7 +314,7 @@ function pump() {
 }
 function request(i, k) {
   const ch = E.book.chunks[i], id = ++reqId;
-  E.inflight = { id, i, k, gen: E.gen, speed: S.speed, ch };
+  E.inflight = { id, i, k, gen: E.gen, speed: S.speed, ch, t0: performance.now() };
   if (!/[A-Za-z0-9]/.test(ch.text)) { setTimeout(() => onAudio({ id, data: new Float32Array(0) })); return; }
   worker.postMessage({ type: 'synth', id, text: ch.text, voice: voiceId(), speed: clamp(S.speed, 0.5, 2) });
 }
@@ -320,6 +325,10 @@ function onAudio(m) {
   if (f.gen === E.gen) {
     let a = m.data || new Float32Array(Math.round(SR * 0.3));
     if (m.error) console.warn('Voice error:', m.error);
+    if (a.length > SR) {                                // how fast the engine works compared with speech
+      const r = (performance.now() - f.t0) / 1000 / (a.length / SR);
+      E.rtf = E.rtf ? 0.8 * E.rtf + 0.2 * r : r;
+    }
     if (f.speed < 0.5 && a.length) a = wsola(a, 0.5 / f.speed);
     if (f.speed >= 0.5 && f.ch.text.length > 40 && a.length) {
       const observed = chunkWeight(f.ch) / (a.length / SR * f.speed);
@@ -436,7 +445,13 @@ function playbackSession(on) {
 function play() {
   if (!E.book) { openPicker(); return; }
   if (engine !== 'system') ensureAudio();
-  else playbackSession(true);                      // must happen inside the tap, before speaking
+  else {
+    playbackSession(true);                         // must happen inside the tap, before speaking
+    if (APPLE_MOBILE && !sessionStorage.getItem('narrator.silentHint')) {
+      sessionStorage.setItem('narrator.silentHint', '1');
+      setTimeout(() => flash('No sound? Turn off Silent mode — iPhone/iPad mute built-in voices in Silent mode.', 8000), 600);
+    }
+  }
   if (E.finished) { E.cur = 0; E.offset = 0; E.pendingFrac = 0; E.finished = false; SV.frac = 0; }
   E.playing = true; E.preroll = true;
   startSource();
@@ -799,8 +814,8 @@ $('btnOpen').onclick = openPicker;
 $('btnOpenBig').onclick = openPicker;
 $('bVoice').onclick = () => { setGender(S.gender === 'female' ? 'male' : 'female'); };
 
-function setGender(g) { S.gender = g; saveSettings(); syncControls(); reVoice(); flash(`Voice: ${voiceLabel()}`); }
-function setAccent(a) { S.accent = a; saveSettings(); syncControls(); reVoice(); flash(`Voice: ${voiceLabel()}`); }
+function setGender(g) { S.gender = g; S.sysVoiceURI = ''; saveSettings(); syncControls(); reVoice(); flash(`Voice: ${voiceLabel()}`); }
+function setAccent(a) { S.accent = a; S.sysVoiceURI = ''; saveSettings(); syncControls(); reVoice(); flash(`Voice: ${voiceLabel()}`); }
 function setSpeed(s) { S.speed = s; saveSettings(); syncControls(); reVoice(); flash(`Speed ${speedLabel(s)}`); }
 function setTheme(t) {
   S.theme = t; saveSettings();
@@ -832,7 +847,23 @@ function syncControls() {
   $('mFollow').checked = S.follow; $('mAwake').checked = S.keepAwake; $('mVolume').value = S.volume;
 }
 $('bSpeed').onclick = () => $('speedSheet').showModal();
-$('btnMenu').onclick = () => { renderRecent(); renderBookmarks(); updateInfo(); $('menu').showModal(); };
+$('btnMenu').onclick = () => { renderRecent(); renderBookmarks(); fillSysVoices(); updateInfo(); $('menu').showModal(); };
+// list of the device's own voices (built-in engine only)
+function fillSysVoices() {
+  const row = $('sysVoiceRow'), sel = $('mSysVoice');
+  row.hidden = engine !== 'system';
+  if (row.hidden) return;
+  sel.textContent = '';
+  const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+  add('', `Automatic (${sysName()})`);
+  const list = sysVoices().filter(v => sysQuality(v) > -2)
+    .sort((a, b) => sysQuality(b) - sysQuality(a) || a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
+  for (const v of list) add(v.voiceURI, `${v.name.replace(/\s*\(English[^)]*\)+$/, '')} (${v.lang.replace('_', '-')})`);
+  sel.value = S.sysVoiceURI && list.some(v => v.voiceURI === S.sysVoiceURI) ? S.sysVoiceURI : '';
+}
+$('mSysVoice').onchange = () => {
+  S.sysVoiceURI = $('mSysVoice').value; saveSettings(); reVoice(); flash(`Voice: ${sysName()}`);
+};
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
 document.querySelectorAll('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close(); }));
 const closeSheets = () => document.querySelectorAll('dialog[open]').forEach(d => d.close());
@@ -872,7 +903,8 @@ function updateInfo() {
   const eng = !ttsReady ? 'loading' : engine === 'gpu' ? 'fast (graphics chip)'
     : engine === 'system' ? `built-in voices (${sysVoice ? sysVoice.name : 'default'})`
     : `compact (processor, ${threads ? 'multi-core' : 'single-core'})`;
-  $('mInfo').textContent = `Version ${VERSION} · voice engine: ${eng}`;
+  const spd = engine !== 'system' && E.rtf ? ` · speed ${(1 / E.rtf).toFixed(1)}× real time${E.rtf > 0.9 ? ' (too slow: expect pauses)' : ''}` : '';
+  $('mInfo').textContent = `Version ${VERSION} · voice engine: ${eng}${spd}`;
 }
 
 document.addEventListener('keydown', e => {
