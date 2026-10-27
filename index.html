@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Narrator</title>
+  <meta name="description" content="Listen to PDF and EPUB files read aloud by natural AI voices that run on your device.">
+  <meta name="theme-color" content="#224a8c">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Narrator">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <button id="btnOpen" class="icon-btn" aria-label="Open a book" title="Open a PDF or EPUB">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4l2 2h9A1.5 1.5 0 0 1 21 8.5v9a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17.5z"/></svg>
+    </button>
+    <div class="titlebox">
+      <div id="title" class="title">Narrator</div>
+      <div class="subrow">
+        <select id="chapter" aria-label="Chapter" disabled><option>No book open</option></select>
+        <span id="where" class="where"></span>
+      </div>
+    </div>
+    <button id="btnMenu" class="icon-btn" aria-label="Menu" title="Menu">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+  </header>
+
+  <main id="reader" tabindex="-1">
+    <div id="welcome" class="welcome">
+      <img src="icons/icon-192.png" alt="" width="84" height="84">
+      <h1>Narrator</h1>
+      <p>Listen to PDF and EPUB files, read aloud by natural AI voices that run right here on your device.</p>
+      <button id="btnOpenBig" class="primary">Open a PDF or EPUB</button>
+      <div id="recentBox" class="recent"></div>
+      <p id="voiceNote" class="note">The first time, about 90&nbsp;MB of voice data is downloaded and kept on this device. Wi-Fi recommended.</p>
+    </div>
+    <article id="text" class="text" hidden></article>
+  </main>
+
+  <div id="readHere" class="pill" hidden>
+    <button id="readHereGo" class="pill-main">▶&nbsp; Read from here</button>
+    <button id="readHereX" class="pill-x" aria-label="Close">✕</button>
+  </div>
+  <button id="nowReading" class="pill now" hidden>⌖ Now reading</button>
+
+  <footer class="player">
+    <div class="seekrow">
+      <span id="elapsed" class="time">0:00</span>
+      <input id="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Position" disabled>
+      <span id="remain" class="time right">-0:00</span>
+    </div>
+    <div class="controls">
+      <button id="bStart" class="ctl" aria-label="Go to start" title="Start (Home)">
+        <svg viewBox="0 0 24 24"><path d="M6 5v14M19 6l-9 6 9 6z"/></svg></button>
+      <button id="bBack" class="ctl" aria-label="Back 10 seconds" title="Back 10 s (←)">
+        <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4h4"/></svg><b>10</b></button>
+      <button id="bPlay" class="ctl play" aria-label="Play" title="Play / Pause (Space)">
+        <svg id="icoPlay" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="icoPause" viewBox="0 0 24 24" hidden><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg></button>
+      <button id="bFwd" class="ctl" aria-label="Forward 30 seconds" title="Forward 30 s (→)">
+        <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v4h-4"/></svg><b>30</b></button>
+      <button id="bEnd" class="ctl" aria-label="Go to last 15 seconds" title="Last 15 s (End)">
+        <svg viewBox="0 0 24 24"><path d="M18 5v14M5 6l9 6-9 6z"/></svg><b class="small">15</b></button>
+    </div>
+    <div class="row2">
+      <button id="bSpeed" class="chip" title="Speed">1×</button>
+      <button id="bVoice" class="chip" title="Switch voice">♀ Female</button>
+      <span id="status" class="status">Starting…</span>
+    </div>
+  </footer>
+
+  <input id="file" type="file" accept=".pdf,.epub,application/pdf,application/epub+zip" hidden>
+
+  <dialog id="menu" class="sheet">
+    <div class="sheet-head"><b>Menu</b><button class="close" data-close>Done</button></div>
+    <div class="sheet-body">
+      <section>
+        <h4>Book</h4>
+        <div class="rowbtns">
+          <button id="mOpen">Open file…</button>
+          <button id="mGoto">Go to page…</button>
+          <button id="mBookmark">Add bookmark</button>
+        </div>
+        <div id="mBookmarks" class="list"></div>
+        <h5>Recent books</h5>
+        <div id="mRecent" class="list"></div>
+      </section>
+      <section>
+        <h4>Voice</h4>
+        <div class="seg" id="segGender">
+          <button data-v="female">Female</button><button data-v="male">Male</button>
+        </div>
+        <div class="seg" id="segAccent">
+          <button data-v="us">American</button><button data-v="uk">British</button>
+        </div>
+      </section>
+      <section>
+        <h4>Speed</h4>
+        <div class="seg wrap" id="segSpeed"></div>
+      </section>
+      <section>
+        <h4>Sleep timer</h4>
+        <select id="mSleep">
+          <option value="0">Off</option><option value="15">15 minutes</option><option value="30">30 minutes</option>
+          <option value="45">45 minutes</option><option value="60">60 minutes</option><option value="90">90 minutes</option>
+          <option value="-1">End of this chapter</option>
+        </select>
+      </section>
+      <section>
+        <h4>Display &amp; sound</h4>
+        <div class="line"><span>Text size</span>
+          <span class="rowbtns"><button id="mSmaller" aria-label="Smaller text">A−</button><button id="mLarger" aria-label="Larger text">A+</button></span></div>
+        <div class="line"><span>Theme</span>
+          <div class="seg small" id="segTheme"><button data-v="auto">Auto</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
+        <label class="line"><span>Follow the narration</span><input type="checkbox" id="mFollow"></label>
+        <label class="line"><span>Keep screen on while playing</span><input type="checkbox" id="mAwake"></label>
+        <div class="line"><span>Volume</span><input type="range" id="mVolume" min="0" max="100"></div>
+      </section>
+      <section class="about">
+        <h4>About</h4>
+        <p>Narrator reads PDF and EPUB files aloud with the Kokoro AI voices, running entirely on this device. Your books are not uploaded anywhere.</p>
+        <p class="small" id="mInfo"></p>
+        <p class="small">Keyboard: Space play/pause · ← back 10 s · → forward 30 s · ↑/↓ sentence · PgUp/PgDn chapter · Home/End.</p>
+        <button id="mReset" class="danger">Remove downloaded voices &amp; data…</button>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog id="speedSheet" class="sheet small-sheet">
+    <div class="sheet-head"><b>Speed</b><button class="close" data-close>Done</button></div>
+    <div class="sheet-body"><div class="seg wrap" id="segSpeed2"></div></div>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

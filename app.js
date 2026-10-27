@@ -1,0 +1,672 @@
+// app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
+import { loadBook, chapterIndex, chunkWeight } from './doc.js';
+
+const VERSION = '1.0';
+const SR = 24000;
+const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+const VOICES = {
+  'female-us': ['af_heart', 'Heart (American)'], 'male-us': ['am_michael', 'Michael (American)'],
+  'female-uk': ['bf_emma', 'Emma (British)'], 'male-uk': ['bm_george', 'George (British)'],
+};
+const LOOKAHEAD = 5, KEEP_BEHIND = 8;
+const MOCK = new URLSearchParams(location.search).has('mock');   // testing without the voice model
+const $ = id => document.getElementById(id);
+
+// ------------------------------------------------------------------ storage
+const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* full or blocked */ } };
+const S = Object.assign({ gender: 'female', accent: 'us', speed: 1, font: 18, theme: 'auto',
+  keepAwake: true, follow: true, volume: 100 }, load('narrator.settings', {}));
+const saveSettings = () => save('narrator.settings', S);
+let positions = load('narrator.positions', {});
+let bookmarks = load('narrator.bookmarks', {});
+let recent = load('narrator.recent', []);          // [{key,name,title,size,opened}]
+
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('narrator', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('books', { keyPath: 'key' });
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function idbDo(mode, fn) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction('books', mode); const st = tx.objectStore('books');
+    const req = fn(st); tx.oncomplete = () => res(req && req.result); tx.onerror = () => rej(tx.error);
+  });
+}
+const bookPut = rec => idbDo('readwrite', st => st.put(rec)).catch(() => {});
+const bookGet = key => idbDo('readonly', st => st.get(key)).catch(() => null);
+const bookDel = key => idbDo('readwrite', st => st.delete(key)).catch(() => {});
+
+// ------------------------------------------------------------------ helpers
+const fmt = s => {
+  s = Math.max(0, Math.floor(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}` : `${m}:${String(x).padStart(2, '0')}`;
+};
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const voiceId = () => VOICES[`${S.gender}-${S.accent}`][0];
+const voiceLabel = () => VOICES[`${S.gender}-${S.accent}`][1];
+const speedLabel = s => `${s}×`;
+let flashMsg = '', flashUntil = 0;
+const flash = (msg, ms = 3500) => { flashMsg = msg; flashUntil = Date.now() + ms; updateStatus(); };
+
+// pitch-preserving slow-down, used only for 0.25x
+function wsola(x, stretch, frame = 1024, hop = 256, tol = 256) {
+  if (stretch <= 1 || x.length < frame * 3) return x;
+  const win = new Float32Array(frame);
+  for (let i = 0; i < frame; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (frame - 1));
+  const outLen = Math.floor(x.length * stretch) + frame;
+  const y = new Float32Array(outLen), w = new Float32Array(outLen);
+  const hopIn = hop / stretch;
+  let prev = -1;
+  for (let k = 0; ; k++) {
+    const nominal = Math.round(k * hopIn);
+    if (nominal + frame + tol >= x.length) break;
+    let start = nominal;
+    if (prev >= 0 && prev + hop + frame <= x.length) {
+      const lo = Math.max(0, nominal - tol), hi = Math.min(x.length - frame, nominal + tol);
+      let best = -Infinity;
+      for (let s = lo; s <= hi; s += 4) {
+        let c = 0;
+        for (let j = 0; j < frame; j += 8) c += x[s + j] * x[prev + hop + j];
+        if (c > best) { best = c; start = s; }
+      }
+    }
+    const o = k * hop;
+    if (o + frame > outLen) break;
+    for (let j = 0; j < frame; j++) { y[o + j] += x[start + j] * win[j]; w[o + j] += win[j]; }
+    prev = start;
+  }
+  const n = Math.floor(x.length * stretch);
+  for (let i = 0; i < n; i++) y[i] = w[i] > 1e-3 ? y[i] / w[i] : y[i];
+  return y.subarray(0, n);
+}
+
+// ------------------------------------------------------------------ voice worker
+let worker, ttsReady = false, ttsError = null, dl = { loaded: 0, total: 0 }, threads = false;
+function startWorker() {
+  if (MOCK) {
+    worker = {
+      postMessage(m) {
+        setTimeout(() => {
+          if (m.type === 'load') {
+            onWorker({ data: { type: 'progress', loaded: 46e6, total: 92e6 } });
+            setTimeout(() => onWorker({ data: { type: 'ready', threads: false } }), 300);
+          } else if (m.type === 'synth') {
+            const dur = Math.max(0.3, m.text.length / 15 / m.speed);
+            const a = new Float32Array(Math.floor(dur * SR));
+            for (let i = 0; i < a.length; i++) a[i] = 0.05 * Math.sin(i / SR * 2 * Math.PI * 220);
+            onWorker({ data: { type: 'audio', id: m.id, data: a } });
+          }
+        }, m.type === 'synth' ? 120 : 50);
+      },
+    };
+  } else {
+    worker = new Worker(new URL('./tts-worker.js', import.meta.url), { type: 'module' });
+    worker.onmessage = onWorker;
+    worker.onerror = e => { ttsError = e.message || 'The voice engine could not start.'; updateStatus(); };
+  }
+  worker.postMessage({ type: 'load' });
+}
+function onWorker(e) {
+  const m = e.data;
+  if (m.type === 'progress') { dl = m; updateStatus(); }
+  else if (m.type === 'ready') {
+    ttsReady = true; threads = m.threads; updateStatus(); pump();
+    $('voiceNote').hidden = true;
+  } else if (m.type === 'error') {
+    const network = /fetch|network|load failed|offline|internet/i.test(m.message || '');
+    if (!network && self.crossOriginIsolated && localStorage.getItem('narrator.noThreads') !== '1') {
+      // fall back to single-threaded mode once, which works everywhere
+      localStorage.setItem('narrator.noThreads', '1');
+      registerSW(true).then(() => location.reload());
+      return;
+    }
+    ttsError = network ? 'no internet connection - tap here to try again' : m.message; updateStatus();
+  } else if (m.type === 'audio') onAudio(m);
+}
+
+// ------------------------------------------------------------------ engine
+const E = {
+  book: null, key: '', cur: 0, offset: 0, pendingFrac: 0, playing: false, finished: false,
+  cache: new Map(), inflight: null, cps: 14.5, ctx: null, gain: null, src: null, startedAt: 0, dur: 0,
+  buffering: false, gen: 0,
+};
+let reqId = 0;
+const ckey = i => `${i}|${voiceId()}|${S.speed}`;
+
+function pump() {
+  if (!ttsReady || !E.book || E.inflight) return;
+  const n = E.book.chunks.length;
+  for (let i = E.cur; i < Math.min(n, E.cur + LOOKAHEAD); i++) {
+    const k = ckey(i);
+    if (!E.cache.has(k)) { request(i, k); return; }
+  }
+  evict();
+}
+function request(i, k) {
+  const ch = E.book.chunks[i], id = ++reqId;
+  E.inflight = { id, i, k, gen: E.gen, speed: S.speed, ch };
+  if (!/[A-Za-z0-9]/.test(ch.text)) { setTimeout(() => onAudio({ id, data: new Float32Array(0) })); return; }
+  worker.postMessage({ type: 'synth', id, text: ch.text, voice: voiceId(), speed: clamp(S.speed, 0.5, 2) });
+}
+function onAudio(m) {
+  const f = E.inflight;
+  if (!f || f.id !== m.id) return;
+  E.inflight = null;
+  if (f.gen === E.gen) {
+    let a = m.data || new Float32Array(Math.round(SR * 0.3));
+    if (m.error) console.warn('Voice error:', m.error);
+    if (f.speed < 0.5 && a.length) a = wsola(a, 0.5 / f.speed);
+    if (f.speed >= 0.5 && f.ch.text.length > 40 && a.length) {
+      const observed = chunkWeight(f.ch) / (a.length / SR * f.speed);
+      if (isFinite(observed) && observed > 3 && observed < 40) E.cps = 0.9 * E.cps + 0.1 * observed;
+    }
+    let pause = f.ch.heading ? 0.85 : f.ch.paraEnd ? 0.55 : 0.18;
+    pause = Math.min(1.6, pause / Math.pow(Math.max(f.speed, 0.25), 0.7));
+    const out = new Float32Array(a.length + Math.floor(SR * pause));
+    out.set(a, 0);
+    E.cache.set(f.k, out);
+    if (f.i === E.cur && E.playing && !E.src) startSource();
+  }
+  pump();
+}
+function evict() {
+  const lo = E.cur - KEEP_BEHIND, hi = E.cur + LOOKAHEAD + 3, v = voiceId(), s = String(S.speed);
+  for (const k of [...E.cache.keys()]) {
+    const [i, kv, ks] = k.split('|');
+    if (+i < lo || +i > hi || kv !== v || ks !== s) E.cache.delete(k);
+  }
+}
+
+function ensureAudio() {
+  if (!E.ctx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    E.ctx = new AC();
+    E.gain = E.ctx.createGain();
+    E.gain.gain.value = S.volume / 100;
+    E.gain.connect(E.ctx.destination);
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch { /* older iOS */ }
+    E.ctx.onstatechange = () => {
+      if (E.playing && E.ctx.state !== 'running' && document.visibilityState === 'visible') E.ctx.resume().catch(() => {});
+    };
+  }
+  if (E.ctx.state !== 'running') E.ctx.resume().catch(() => {});
+}
+function stopSource() {
+  if (E.src) { const s = E.src; E.src = null; s.onended = null; try { s.stop(); } catch { /* already stopped */ } }
+}
+function startSource() {
+  const a = E.cache.get(ckey(E.cur));
+  if (!a) { E.buffering = true; pump(); updateStatus(); return; }
+  E.buffering = false;
+  E.dur = a.length / SR;
+  if (E.pendingFrac != null) { E.offset = E.pendingFrac * E.dur; E.pendingFrac = null; }
+  if (E.offset >= E.dur - 0.02) { advance(); return; }
+  const buf = E.ctx.createBuffer(1, a.length, SR);
+  buf.copyToChannel(a, 0);
+  const src = E.ctx.createBufferSource();
+  src.buffer = buf; src.connect(E.gain);
+  src.onended = () => { if (E.src !== src) return; E.src = null; if (E.playing) advance(); };
+  E.startedAt = E.ctx.currentTime - E.offset;
+  src.start(0, E.offset);
+  E.src = src;
+  pump();
+}
+function advance() {
+  if (E.cur + 1 >= E.book.chunks.length) {
+    E.playing = false; E.finished = true; E.offset = E.dur; onPlayState(); flash('Finished.'); return;
+  }
+  E.cur++; E.offset = 0; E.pendingFrac = null;
+  startSource();
+  refreshHighlight();
+}
+const curOffset = () => (E.src && E.playing) ? Math.max(0, E.ctx.currentTime - E.startedAt) : E.offset;
+function curFrac() {
+  if (E.pendingFrac != null) return E.pendingFrac;
+  const a = E.cache.get(ckey(E.cur));
+  return a && a.length ? clamp(curOffset() / (a.length / SR), 0, 1) : 0;
+}
+
+function play() {
+  if (!E.book) { openPicker(); return; }
+  ensureAudio();
+  if (E.finished) { E.cur = 0; E.offset = 0; E.pendingFrac = 0; E.finished = false; }
+  E.playing = true;
+  startSource();
+  onPlayState();
+}
+function pause() {
+  E.offset = curOffset(); E.pendingFrac = null;
+  stopSource(); E.playing = false; E.buffering = false;
+  onPlayState(); savePosition(true);
+}
+const togglePlay = () => (E.playing ? pause() : play());
+function seek(i, frac = 0) {
+  if (!E.book) return;
+  stopSource();
+  E.cur = clamp(i, 0, E.book.chunks.length - 1); E.offset = 0; E.pendingFrac = clamp(frac, 0, 0.999); E.finished = false;
+  if (E.playing) startSource(); else pump();
+  refreshHighlight(true); updateTimes();
+}
+function reVoice() {          // voice or speed changed: keep the place
+  const frac = curFrac();
+  stopSource(); E.offset = 0; E.pendingFrac = frac;
+  if (E.playing) startSource(); else pump();
+  updateTimes(); updateStatus();
+}
+
+// timeline (estimated listening seconds at the current speed)
+const rate = () => E.cps * S.speed;
+const timeOf = (cur, frac) => (E.book.prefix[cur] + frac * E.book.weights[cur]) / rate();
+const totalTime = () => E.book ? E.book.prefix[E.book.chunks.length] / rate() : 0;
+const nowTime = () => E.book ? timeOf(E.cur, curFrac()) : 0;
+function seekTime(t) {
+  if (!E.book) return;
+  const b = E.book;
+  t = clamp(t, 0, totalTime() - 0.05);
+  const w = t * rate();
+  let lo = 0, hi = b.chunks.length - 1;
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (b.prefix[m] <= w) lo = m; else hi = m - 1; }
+  seek(lo, (w - b.prefix[lo]) / b.weights[lo]);
+}
+const jump = s => E.book && seekTime(nowTime() + s);
+
+// ------------------------------------------------------------------ book loading
+const fileKey = f => `${f.name}|${f.size}`;
+let openBusy = false;
+function openPicker() { $('file').value = ''; $('file').click(); }
+$('file').addEventListener('change', async () => {
+  const f = $('file').files[0];
+  if (!f) return;
+  const data = await f.arrayBuffer();
+  await openBook({ key: fileKey(f), name: f.name, size: f.size, data }, true);
+});
+
+async function openBook(rec, store) {
+  if (openBusy) return;
+  openBusy = true;
+  if (E.book) { savePosition(true); if (E.playing) pause(); }
+  flash(`Opening ${rec.name}…`, 60000);
+  try {
+    const book = await loadBook(rec.data.slice(0), rec.name, p => flash(`Reading ${rec.name}… ${Math.round(p * 100)}%`, 60000));
+    E.book = book; E.key = rec.key; E.gen++; E.cache.clear(); E.inflight = null;
+    const pos = positions[rec.key];
+    E.cur = pos && pos.chunk < book.chunks.length ? pos.chunk : 0;
+    if (pos && pos.n !== book.chunks.length && book.pageFirst.has(pos.page)) E.cur = book.pageFirst.get(pos.page);
+    E.offset = 0; E.pendingFrac = 0; E.finished = false;
+    recent = [{ key: rec.key, name: rec.name, title: book.title, size: rec.size, opened: Date.now() },
+      ...recent.filter(r => r.key !== rec.key)].slice(0, 6);
+    save('narrator.recent', recent);
+    if (store) {
+      await bookPut({ key: rec.key, name: rec.name, size: rec.size, data: rec.data });
+      const keep = new Set(recent.map(r => r.key));
+      const db = await idb();
+      const keys = await new Promise(r => { const q = db.transaction('books').objectStore('books').getAllKeys(); q.onsuccess = () => r(q.result); q.onerror = () => r([]); });
+      for (const k of keys) if (!keep.has(k)) bookDel(k);
+    }
+    setupBookUI();
+    flash(E.cur ? `Resuming at ${book.pageLabel.toLowerCase()} ${book.chunks[E.cur].page + 1}` :
+      `Opened · ${book.chunks.length.toLocaleString()} sentences · ${book.toc.length} chapters`);
+    pump();
+  } catch (err) {
+    console.error(err);
+    flashMsg = ''; alert(`Could not open ${rec.name}\n\n${err.message || err}`);
+  } finally { openBusy = false; updateStatus(); }
+}
+
+// ------------------------------------------------------------------ reading pane
+let viewLo = 0, viewHi = 0, shownCur = -1, followPauseUntil = 0, picked = -1;
+function setupBookUI() {
+  const b = E.book;
+  document.title = `${b.title} - Narrator`;
+  $('title').textContent = b.title;
+  $('welcome').hidden = true; $('text').hidden = false;
+  const sel = $('chapter');
+  sel.innerHTML = '';
+  const minL = Math.min(...b.toc.map(e => e.level), 1);
+  b.toc.forEach((e, k) => {
+    const o = document.createElement('option');
+    o.value = k; o.textContent = ' '.repeat(Math.max(0, e.level - minL)) + e.title;
+    sel.appendChild(o);
+  });
+  sel.disabled = !b.toc.length;
+  if (!b.toc.length) sel.innerHTML = '<option>No chapters found</option>';
+  $('seek').disabled = false;
+  viewLo = viewHi = 0; shownCur = -1;
+  refreshHighlight(true, true);
+  renderBookmarks(); updateTimes(); updateMedia();
+}
+function renderWindow(center) {
+  const b = E.book, n = b.chunks.length;
+  viewLo = Math.max(0, center - 60); viewHi = Math.min(n, center + 180);
+  const art = $('text');
+  art.textContent = '';
+  const frag = document.createDocumentFragment();
+  if (viewLo > 0) { const g = document.createElement('p'); g.className = 'gap'; g.textContent = '…'; frag.appendChild(g); }
+  let block = null, para = -1;
+  for (let i = viewLo; i < viewHi; i++) {
+    const c = b.chunks[i];
+    if (c.para !== para || !block) {
+      block = document.createElement(c.heading ? 'h3' : 'p');
+      frag.appendChild(block); para = c.para;
+    }
+    const s = document.createElement('span');
+    s.className = 's'; s.dataset.i = i; s.textContent = c.text;
+    block.appendChild(s); block.appendChild(document.createTextNode(' '));
+  }
+  if (viewHi < n) { const g = document.createElement('p'); g.className = 'gap'; g.textContent = '…'; frag.appendChild(g); }
+  art.appendChild(frag);
+}
+function refreshHighlight(force = false, scroll = false) {
+  if (!E.book) return;
+  const cur = E.cur, n = E.book.chunks.length;
+  const inside = (viewLo === 0 || cur >= viewLo + 15) && (viewHi === n || cur < viewHi - 30) && cur >= viewLo && cur < viewHi;
+  if (force || !inside) renderWindow(cur);
+  const art = $('text');
+  art.querySelector('.s.hl')?.classList.remove('hl');
+  const el = art.querySelector(`.s[data-i="${cur}"]`);
+  if (el) {
+    el.classList.add('hl');
+    if (scroll || (S.follow && Date.now() >= followPauseUntil)) el.scrollIntoView({ block: 'center', behavior: scroll ? 'auto' : 'smooth' });
+  }
+  if (shownCur !== cur) {
+    shownCur = cur;
+    const k = chapterIndex(E.book, cur);
+    if (k >= 0 && $('chapter').value !== String(k)) $('chapter').value = String(k);
+    const pg = E.book.chunks[cur].page + 1;
+    $('where').textContent = `${E.book.pageLabel === 'Page' ? 'p.' : '§'}${pg}/${E.book.npages}`;
+    updateMedia();
+    if (sleep.chapter != null && k !== sleep.chapter && E.playing) {
+      sleep.chapter = null; $('mSleep').value = '0'; pause(); flash('Sleep timer: paused at the end of the chapter');
+    }
+  }
+  $('nowReading').hidden = !(Date.now() < followPauseUntil);
+}
+const userScrolled = () => { if (E.book) { followPauseUntil = Date.now() + 10000; $('nowReading').hidden = false; } };
+['wheel', 'touchmove'].forEach(ev => $('reader').addEventListener(ev, userScrolled, { passive: true }));
+$('nowReading').onclick = () => { followPauseUntil = 0; $('nowReading').hidden = true; refreshHighlight(false, true); };
+
+$('text').addEventListener('click', e => {
+  const s = e.target.closest('.s'); if (!s) return;
+  $('text').querySelector('.s.picked')?.classList.remove('picked');
+  picked = +s.dataset.i; s.classList.add('picked');
+  $('readHere').hidden = false;
+});
+$('text').addEventListener('dblclick', e => {
+  const s = e.target.closest('.s'); if (!s) return;
+  window.getSelection()?.removeAllRanges();
+  readFrom(+s.dataset.i);
+});
+function readFrom(i) {
+  $('readHere').hidden = true; $('text').querySelector('.s.picked')?.classList.remove('picked');
+  followPauseUntil = 0; seek(i, 0);
+  if (!E.playing) play();
+}
+$('readHereGo').onclick = () => readFrom(picked);
+$('readHereX').onclick = () => { $('readHere').hidden = true; $('text').querySelector('.s.picked')?.classList.remove('picked'); };
+
+// ------------------------------------------------------------------ chapters, pages, bookmarks
+$('chapter').addEventListener('change', () => gotoChapter(+$('chapter').value));
+function gotoChapter(k) {
+  if (!E.book || k < 0 || k >= E.book.toc.length) return;
+  followPauseUntil = 0; seek(E.book.toc[k].chunk, 0);
+}
+function nextChapter() {
+  if (!E.book) return;
+  const t = E.book.tocStarts.find(([c]) => c > E.cur); if (t) gotoChapter(t[1]);
+}
+function prevChapter() {
+  if (!E.book) return;
+  const s = E.book.tocStarts; let j = -1;
+  for (let k = 0; k < s.length; k++) if (s[k][0] <= E.cur) j = k;
+  if (j >= 0 && E.cur - s[j][0] <= 2) j--;
+  if (j >= 0) gotoChapter(s[j][1]); else seek(0);
+}
+function gotoPage() {
+  if (!E.book) return;
+  const label = E.book.pageLabel.toLowerCase();
+  const v = prompt(`Go to ${label} (1–${E.book.npages}):`); if (!v) return;
+  let q = clamp(parseInt(v, 10) - 1, 0, E.book.npages - 1);
+  while (q < E.book.npages && !E.book.pageFirst.has(q)) q++;
+  if (q < E.book.npages) { followPauseUntil = 0; seek(E.book.pageFirst.get(q)); closeSheets(); }
+}
+function addBookmark() {
+  if (!E.book) return;
+  const c = E.book.chunks[E.cur], k = chapterIndex(E.book, E.cur);
+  const chap = k >= 0 ? E.book.toc[k].title.slice(0, 32) : '';
+  const label = `${E.book.pageLabel === 'Page' ? 'p.' : '§'}${c.page + 1} ${chap ? chap + ' — ' : ''}${c.text.slice(0, 40)}${c.text.length > 40 ? '…' : ''}`;
+  (bookmarks[E.key] ||= []).push({ chunk: E.cur, label });
+  bookmarks[E.key].sort((a, b) => a.chunk - b.chunk);
+  save('narrator.bookmarks', bookmarks); renderBookmarks(); flash('Bookmark added');
+}
+function renderBookmarks() {
+  const box = $('mBookmarks'); box.textContent = '';
+  for (const [idx, b] of (bookmarks[E.key] || []).entries()) {
+    const row = document.createElement('button');
+    row.innerHTML = '<span class="t"></span><span class="x" aria-label="Remove">✕</span>';
+    row.querySelector('.t').textContent = '🔖 ' + b.label;
+    row.onclick = ev => {
+      if (ev.target.classList.contains('x')) {
+        bookmarks[E.key].splice(idx, 1); save('narrator.bookmarks', bookmarks); renderBookmarks();
+      } else { followPauseUntil = 0; seek(b.chunk); closeSheets(); }
+    };
+    box.appendChild(row);
+  }
+}
+function renderRecent() {
+  const mk = (box, inMenu) => {
+    box.textContent = '';
+    for (const r of recent) {
+      const row = document.createElement('button');
+      const pos = positions[r.key];
+      row.innerHTML = '<span class="t"></span><span class="m"></span>' + (inMenu ? '<span class="x" aria-label="Remove">✕</span>' : '');
+      row.querySelector('.t').textContent = (inMenu ? '' : '▶ Continue: ') + (r.title || r.name);
+      row.querySelector('.m').textContent = pos && pos.pct != null ? `${pos.pct}%` : '';
+      row.onclick = async ev => {
+        if (ev.target.classList.contains('x')) {
+          recent = recent.filter(x => x.key !== r.key); save('narrator.recent', recent); bookDel(r.key); renderRecent(); return;
+        }
+        const rec = await bookGet(r.key);
+        closeSheets();
+        if (rec) openBook(rec, false);
+        else { alert('This book is no longer stored on this device. Please open the file again.'); openPicker(); }
+      };
+      box.appendChild(row);
+    }
+  };
+  mk($('recentBox'), false);
+  mk($('mRecent'), true);
+  if (!recent.length) $('mRecent').innerHTML = '<p class="small" style="color:var(--muted)">None yet.</p>';
+}
+
+function savePosition(force = false) {
+  if (!E.book) return;
+  const pct = Math.round(100 * E.book.prefix[E.cur] / E.book.prefix[E.book.chunks.length]);
+  const rec = { chunk: E.cur, page: E.book.chunks[E.cur].page, n: E.book.chunks.length, pct, t: Date.now() };
+  const old = positions[E.key];
+  if (force || !old || old.chunk !== rec.chunk) { positions[E.key] = rec; save('narrator.positions', positions); }
+}
+
+// ------------------------------------------------------------------ status, times, media session
+function updateTimes() {
+  if (!E.book) return;
+  const now = nowTime(), tot = totalTime();
+  $('elapsed').textContent = fmt(now);
+  $('remain').textContent = '-' + fmt(tot - now);
+  if (!seeking) $('seek').value = String(Math.round(1000 * now / Math.max(1, tot)));
+}
+function updateStatus() {
+  let s;
+  if (Date.now() < flashUntil) s = flashMsg;
+  else if (ttsError) s = '⚠ Voices could not load: ' + ttsError;
+  else if (!ttsReady) {
+    s = dl.total ? `Downloading voices ${Math.round(100 * dl.loaded / dl.total)}% (${Math.round(dl.loaded / 1e6)} of ${Math.round(dl.total / 1e6)} MB)` : 'Preparing voices…';
+  } else if (E.buffering && E.playing) s = 'Preparing audio…';
+  else if (!E.book) s = 'Ready — open a book';
+  else s = `${E.playing ? 'Playing' : 'Paused'} · ${voiceLabel().split(' ')[0]}${sleep.until ? ' · sleep ' + fmt((sleep.until - Date.now()) / 1000) : sleep.chapter != null ? ' · sleep at chapter end' : ''}`;
+  $('status').textContent = s;
+}
+function onPlayState() {
+  $('icoPlay').hidden = E.playing; $('icoPause').hidden = !E.playing;
+  $('bPlay').setAttribute('aria-label', E.playing ? 'Pause' : 'Play');
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = E.playing ? 'playing' : 'paused';
+  wakeLock(); updateStatus();
+}
+function updateMedia() {
+  if (!('mediaSession' in navigator) || !E.book) return;
+  const k = chapterIndex(E.book, E.cur);
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: k >= 0 ? E.book.toc[k].title : E.book.title, artist: E.book.title, album: 'Narrator',
+      artwork: [{ src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' }],
+    });
+  } catch { /* unsupported */ }
+}
+if ('mediaSession' in navigator) {
+  const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch { /* unsupported */ } };
+  h('play', play); h('pause', pause);
+  h('seekbackward', () => jump(-10)); h('seekforward', () => jump(30));
+  h('previoustrack', prevChapter); h('nexttrack', nextChapter);
+}
+let lock = null;
+async function wakeLock() {
+  try {
+    if (E.playing && S.keepAwake && 'wakeLock' in navigator && document.visibilityState === 'visible') {
+      if (!lock) { lock = await navigator.wakeLock.request('screen'); lock.addEventListener('release', () => { lock = null; }); }
+    } else if (lock) { await lock.release(); lock = null; }
+  } catch { lock = null; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') savePosition(true);
+  else { wakeLock(); if (E.playing && E.ctx && E.ctx.state !== 'running') E.ctx.resume().catch(() => {}); }
+});
+window.addEventListener('pagehide', () => savePosition(true));
+
+// ------------------------------------------------------------------ sleep timer
+const sleep = { until: 0, chapter: null };
+$('mSleep').addEventListener('change', () => {
+  const v = +$('mSleep').value;
+  sleep.until = 0; sleep.chapter = null;
+  if (v > 0) { sleep.until = Date.now() + v * 60000; flash(`Will pause in ${v} minutes`); }
+  else if (v < 0 && E.book) { sleep.chapter = chapterIndex(E.book, E.cur); flash('Will pause at the end of this chapter'); }
+  else flash('Sleep timer off');
+});
+
+// ------------------------------------------------------------------ controls
+let seeking = false;
+$('seek').addEventListener('input', () => {
+  seeking = true;
+  $('elapsed').textContent = fmt(totalTime() * $('seek').value / 1000);
+});
+$('seek').addEventListener('change', () => { seeking = false; followPauseUntil = 0; seekTime(totalTime() * $('seek').value / 1000); });
+$('bPlay').onclick = togglePlay;
+$('status').onclick = () => { if (ttsError) location.reload(); };
+$('bBack').onclick = () => jump(-10);
+$('bFwd').onclick = () => jump(30);
+$('bStart').onclick = () => { followPauseUntil = 0; seek(0); };
+$('bEnd').onclick = () => { followPauseUntil = 0; E.book && seekTime(totalTime() - 15); };
+$('btnOpen').onclick = openPicker;
+$('btnOpenBig').onclick = openPicker;
+$('bVoice').onclick = () => { setGender(S.gender === 'female' ? 'male' : 'female'); };
+
+function setGender(g) { S.gender = g; saveSettings(); syncControls(); reVoice(); flash(`Voice: ${voiceLabel()}`); }
+function setAccent(a) { S.accent = a; saveSettings(); syncControls(); reVoice(); flash(`Voice: ${voiceLabel()}`); }
+function setSpeed(s) { S.speed = s; saveSettings(); syncControls(); reVoice(); flash(`Speed ${speedLabel(s)}`); }
+function setTheme(t) {
+  S.theme = t; saveSettings();
+  if (t === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', t);
+  syncControls();
+}
+function setFont(px) { S.font = clamp(px, 13, 32); saveSettings(); document.documentElement.style.setProperty('--reading-size', S.font + 'px'); }
+
+function buildSeg(box, values, label, onPick) {
+  box.textContent = '';
+  for (const v of values) {
+    const b = document.createElement('button'); b.dataset.v = v; b.textContent = label(v);
+    b.onclick = () => onPick(v); box.appendChild(b);
+  }
+}
+buildSeg($('segSpeed'), SPEEDS, speedLabel, setSpeed);
+buildSeg($('segSpeed2'), SPEEDS, speedLabel, v => { setSpeed(v); $('speedSheet').close(); });
+for (const b of $('segGender').children) b.onclick = () => setGender(b.dataset.v);
+for (const b of $('segAccent').children) b.onclick = () => setAccent(b.dataset.v);
+for (const b of $('segTheme').children) b.onclick = () => setTheme(b.dataset.v);
+function syncControls() {
+  const mark = (box, v) => { for (const b of box.children) b.classList.toggle('on', b.dataset.v === String(v)); };
+  mark($('segSpeed'), S.speed); mark($('segSpeed2'), S.speed);
+  mark($('segGender'), S.gender); mark($('segAccent'), S.accent); mark($('segTheme'), S.theme);
+  $('bSpeed').textContent = speedLabel(S.speed);
+  $('bVoice').textContent = S.gender === 'female' ? '♀ Female' : '♂ Male';
+  $('mFollow').checked = S.follow; $('mAwake').checked = S.keepAwake; $('mVolume').value = S.volume;
+}
+$('bSpeed').onclick = () => $('speedSheet').showModal();
+$('btnMenu').onclick = () => { renderRecent(); renderBookmarks(); updateInfo(); $('menu').showModal(); };
+document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
+document.querySelectorAll('dialog').forEach(d => d.addEventListener('click', e => { if (e.target === d) d.close(); }));
+const closeSheets = () => document.querySelectorAll('dialog[open]').forEach(d => d.close());
+$('mOpen').onclick = () => { closeSheets(); openPicker(); };
+$('mGoto').onclick = gotoPage;
+$('mBookmark').onclick = () => { addBookmark(); };
+$('mSmaller').onclick = () => setFont(S.font - 1);
+$('mLarger').onclick = () => setFont(S.font + 1);
+$('mFollow').onchange = () => { S.follow = $('mFollow').checked; saveSettings(); };
+$('mAwake').onchange = () => { S.keepAwake = $('mAwake').checked; saveSettings(); wakeLock(); };
+$('mVolume').oninput = () => { S.volume = +$('mVolume').value; saveSettings(); if (E.gain) E.gain.gain.value = S.volume / 100; };
+$('mReset').onclick = async () => {
+  if (!confirm('Remove the downloaded voices, stored books, reading positions and settings from this device?')) return;
+  try { for (const k of await caches.keys()) await caches.delete(k); } catch { /* ignore */ }
+  try { indexedDB.deleteDatabase('narrator'); } catch { /* ignore */ }
+  localStorage.clear();
+  location.reload();
+};
+function updateInfo() {
+  $('mInfo').textContent = `Version ${VERSION} · voice engine ${ttsReady ? 'ready' : 'loading'}${ttsReady ? (threads ? ' (multi-core)' : ' (single-core)') : ''}`;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.target.closest('input, select, textarea, dialog')) return;
+  const k = e.key;
+  const map = {
+    ' ': togglePlay, ArrowLeft: () => jump(-10), ArrowRight: () => jump(30),
+    ArrowUp: () => seek(E.cur - 1), ArrowDown: () => seek(E.cur + 1),
+    PageUp: prevChapter, PageDown: nextChapter, Home: () => seek(0), End: () => E.book && seekTime(totalTime() - 15),
+  };
+  if (map[k]) { e.preventDefault(); map[k](); }
+  else if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === 'o') { e.preventDefault(); openPicker(); }
+});
+
+// ------------------------------------------------------------------ service worker (offline + speed)
+async function registerSW(noThreads) {
+  if (!('serviceWorker' in navigator) || MOCK) return;
+  const nt = noThreads || localStorage.getItem('narrator.noThreads') === '1';
+  try {
+    const reg = await navigator.serviceWorker.register(`sw.js${nt ? '?coi=0' : ''}`);
+    if (!nt && !self.crossOriginIsolated && !sessionStorage.getItem('narrator.coiReload')) {
+      // reload once so the page runs with multi-core voice synthesis enabled
+      const go = () => { sessionStorage.setItem('narrator.coiReload', '1'); location.reload(); };
+      if (navigator.serviceWorker.controller) go();
+      else navigator.serviceWorker.addEventListener('controllerchange', go, { once: true });
+    }
+    return reg;
+  } catch (e) { console.warn('Service worker not registered', e); }
+}
+
+// ------------------------------------------------------------------ start
+setTheme(S.theme); setFont(S.font); syncControls(); renderRecent();
+registerSW();
+try { navigator.storage?.persist?.(); } catch { /* ignore */ }
+startWorker();
+setInterval(() => {
+  if (E.book) {
+    if (E.cur !== shownCur) refreshHighlight();
+    updateTimes();
+    if (Date.now() - (E._lastSave || 0) > 5000) { E._lastSave = Date.now(); savePosition(); }
+    if (Date.now() >= followPauseUntil && !$('nowReading').hidden) $('nowReading').hidden = true;
+  }
+  if (sleep.until && Date.now() >= sleep.until) { sleep.until = 0; $('mSleep').value = '0'; if (E.playing) pause(); flash('Sleep timer: paused'); }
+  updateStatus();
+}, 250);
