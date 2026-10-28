@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.2.2';
+const VERSION = '1.2.3';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -179,6 +179,8 @@ const MALE_RE = /alex|\btom\b|aaron|evan|nathan|fred|daniel|arthur|oliver|rishi|
 const NOVELTY_RE = /bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|junior|ralph|princess|deranged|hysterical/i;
 // older, robotic-sounding voices: used only when nothing better is available
 const ELOQUENCE_RE = /\b(eddy|flo|grandma|grandpa|reed|rocko|sandy|shelley|fred|kathy)\b/i;
+// the most natural Apple voices: chosen first whenever Safari makes them available
+const PREFERRED_RE = { female: /\b(zoe|ava)\b/i, male: /\b(evan|nathan)\b/i };
 let sysVoice = null;
 const SV = { gen: 0, queued: -1, frac: 0, startChar: 0, tStart: 0, lastEvent: 0 };
 
@@ -203,7 +205,7 @@ function sysPick() {
   for (const v of list) {
     const g = sysGender(v);
     // the chosen gender comes first, then voice quality, then accent
-    const score = (g === S.gender ? 40 : g ? 0 : 15) + sysQuality(v) * 10 + (accent.test(v.lang) ? 3 : 0) + (v.localService ? 0.5 : 0);
+    const score = (g === S.gender ? 40 : g ? 0 : 15) + (PREFERRED_RE[S.gender].test(v.name) ? 25 : 0) + sysQuality(v) * 10 + (accent.test(v.lang) ? 3 : 0) + (v.localService ? 0.5 : 0);
     if (score > bestScore) { bestScore = score; best = v; }
   }
   sysVoice = best;
