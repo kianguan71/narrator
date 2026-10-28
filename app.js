@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.3';
+const VERSION = '1.2.5';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -21,8 +21,7 @@ const $ = id => document.getElementById(id);
 const load = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* full or blocked */ } };
 const S = Object.assign({ gender: 'female', accent: 'us', speed: 1, font: 18, theme: 'auto',
-  keepAwake: true, follow: true, volume: 100, engine: 'auto', sysVoiceURI: '',
-  music: false, musicVol: 30, musicTrack: 'all' }, load('narrator.settings', {}));
+  keepAwake: true, follow: true, volume: 100, engine: 'auto', sysVoiceURI: '' }, load('narrator.settings', {}));
 const saveSettings = () => save('narrator.settings', S);
 let positions = load('narrator.positions', {});
 let bookmarks = load('narrator.bookmarks', {});
@@ -447,57 +446,6 @@ function playbackSession(on) {
   } catch { /* ignore */ }
 }
 
-// ------------------------------------------------------------------ background music
-// "Atmospheric Piano" by Chad Crouch (CC BY-NC 4.0), streamed from the Free Music Archive.
-const MUSIC_BASE = 'https://files.freemusicarchive.org/storage-freemusicarchive-org/music/ccCommunity/Chad_Crouch/Atmospheric_Piano/Chad_Crouch_-_';
-const MUSIC = ['Daisy', 'Ginger', 'Ink', 'Lilac', 'Linen', 'Seafoam'];
-const M = { el: null, gain: null, idx: 0, on: false };
-const musicLevel = () => Math.pow(S.musicVol / 100, 1.5) * 0.6;    // gentle curve: 30% -> about 0.1
-function musicSetup() {
-  if (M.el) return true;
-  try {
-    ensureAudio();                                    // shared audio output (also used by the AI voices)
-    M.el = new Audio();
-    M.el.crossOrigin = 'anonymous'; M.el.preload = 'auto';
-    M.el.setAttribute('playsinline', '');
-    M.el.addEventListener('ended', () => { if (M.on) musicNext(); });
-    M.el.addEventListener('error', () => { if (M.on) setTimeout(musicNext, 3000); });
-    const src = E.ctx.createMediaElementSource(M.el);
-    M.gain = E.ctx.createGain(); M.gain.gain.value = 0;
-    src.connect(M.gain); M.gain.connect(E.ctx.destination);
-    return true;
-  } catch (err) { console.warn('Music unavailable', err); M.el = null; return false; }
-}
-function musicLoad(i) {
-  M.idx = (i + MUSIC.length) % MUSIC.length;
-  M.el.src = MUSIC_BASE + MUSIC[M.idx] + '.mp3';
-}
-function musicNext() {
-  if (S.musicTrack === 'all') musicLoad(M.idx + 1); else musicLoad(MUSIC.indexOf(S.musicTrack));
-  if (M.on) M.el.play().catch(() => {});
-  updateStatus();
-}
-function musicFade(to, secs) {
-  const g = M.gain.gain, t = E.ctx.currentTime;
-  g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(to, t + secs);
-}
-// play the music while the narration plays (call from a tap the first time, for iPhone)
-function syncMusic() {
-  const want = S.music && E.playing;
-  if (want && !M.on) {
-    if (!musicSetup()) return;
-    if (E.ctx.state !== 'running') E.ctx.resume().catch(() => {});
-    const pick = S.musicTrack === 'all' ? M.idx : MUSIC.indexOf(S.musicTrack);
-    if (!M.el.src || pick !== M.idx) musicLoad(pick < 0 ? 0 : pick);
-    M.on = true;
-    M.el.play().then(() => musicFade(musicLevel(), 1.5)).catch(err => { M.on = false; console.warn('Music did not start', err); });
-  } else if (!want && M.on) {
-    M.on = false;
-    musicFade(0, 0.6);
-    const el = M.el; setTimeout(() => { if (!M.on) el.pause(); }, 650);
-  }
-}
-
 function play() {
   if (!E.book) { openPicker(); return; }
   if (engine !== 'system') ensureAudio();
@@ -512,7 +460,6 @@ function play() {
   E.playing = true; E.preroll = true;
   startSource();
   onPlayState();
-  syncMusic();
 }
 function pause() {
   if (engine === 'system') E.pendingFrac = curFrac();
@@ -788,7 +735,7 @@ function updateStatus() {
       : `Downloading voices ${pct}% (${Math.round(dl.loaded / 1e6)} of ${Math.round(dl.total / 1e6)} MB)`;
   } else if (E.buffering && E.playing) s = 'Preparing audio…';
   else if (!E.book) s = 'Ready — open a book';
-  else s = `${E.playing ? 'Playing' : 'Paused'} · ${engine === 'system' ? sysName() : voiceLabel().split(' ')[0]}${M.on ? ' · ♪ ' + MUSIC[M.idx] : ''}${sleep.until ? ' · sleep ' + fmt((sleep.until - Date.now()) / 1000) : sleep.chapter != null ? ' · sleep at chapter end' : ''}`;
+  else s = `${E.playing ? 'Playing' : 'Paused'} · ${engine === 'system' ? sysName() : voiceLabel().split(' ')[0]}${sleep.until ? ' · sleep ' + fmt((sleep.until - Date.now()) / 1000) : sleep.chapter != null ? ' · sleep at chapter end' : ''}`;
   $('status').textContent = s;
 }
 function onPlayState() {
@@ -796,7 +743,7 @@ function onPlayState() {
   $('bPlay').setAttribute('aria-label', E.playing ? 'Pause' : 'Play');
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = E.playing ? 'playing' : 'paused';
   markActive();
-  if (!E.playing) { playbackSession(false); syncMusic(); }
+  if (!E.playing) playbackSession(false);
   wakeLock(); updateStatus();
 }
 function updateMedia() {
@@ -899,7 +846,6 @@ function syncControls() {
   mark($('segSpeed'), S.speed); mark($('segSpeed2'), S.speed);
   mark($('segGender'), S.gender); mark($('segAccent'), S.accent); mark($('segTheme'), S.theme);
   mark($('segEngine'), S.engine);
-  $('mMusic').checked = S.music; $('mMusicTrack').value = S.musicTrack; $('mMusicVol').value = S.musicVol;
   $('bSpeed').textContent = speedLabel(S.speed);
   $('bVoice').textContent = S.gender === 'female' ? '♀ Female' : '♂ Male';
   $('mFollow').checked = S.follow; $('mAwake').checked = S.keepAwake; $('mVolume').value = S.volume;
@@ -932,15 +878,6 @@ $('mSmaller').onclick = () => setFont(S.font - 1);
 $('mLarger').onclick = () => setFont(S.font + 1);
 $('mFollow').onchange = () => { S.follow = $('mFollow').checked; saveSettings(); };
 $('mAwake').onchange = () => { S.keepAwake = $('mAwake').checked; saveSettings(); wakeLock(); };
-$('mMusic').onchange = () => {
-  S.music = $('mMusic').checked; saveSettings(); syncMusic();
-  flash(S.music ? (E.playing ? 'Background music on' : 'Background music will play with the narration') : 'Background music off');
-};
-$('mMusicTrack').onchange = () => {
-  S.musicTrack = $('mMusicTrack').value; saveSettings();
-  if (M.el) { musicLoad(S.musicTrack === 'all' ? M.idx : MUSIC.indexOf(S.musicTrack)); if (M.on) M.el.play().catch(() => {}); }
-};
-$('mMusicVol').oninput = () => { S.musicVol = +$('mMusicVol').value; saveSettings(); if (M.on) musicFade(musicLevel(), 0.2); };
 $('mVolume').oninput = () => { S.volume = +$('mVolume').value; saveSettings(); if (E.gain) E.gain.gain.value = S.volume / 100; };
 for (const b of $('segEngine').children) b.onclick = () => setEngine(b.dataset.v);
 function setEngine(v) {
