@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.2.4';
+const VERSION = '1.2.5';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -253,7 +253,7 @@ function sysEnqueue(i, frac = 0) {
   }
   const u = new SpeechSynthesisUtterance(full.slice(start));
   if (sysVoice) { u.voice = sysVoice; u.lang = sysVoice.lang; } else u.lang = S.accent === 'uk' ? 'en-GB' : 'en-US';
-  u.rate = S.speed * (sysBoost() ? 1.1 : 1); u.pitch = sysBoost() ? 1.1 : 1; u.volume = S.volume / 100;
+  u.rate = S.speed * (sysBoost() ? 1.05 : 1); u.pitch = sysBoost() ? 1.05 : 1; u.volume = S.volume / 100;
   u.onstart = () => {
     if (g !== SV.gen) return;
     SV.lastEvent = Date.now(); SV.tStart = Date.now(); SV.startChar = start;
@@ -905,7 +905,7 @@ $('mReset').onclick = async () => {
 };
 function updateInfo() {
   const eng = !ttsReady ? 'loading' : engine === 'gpu' ? 'fast (graphics chip)'
-    : engine === 'system' ? `built-in voices (${sysVoice ? sysVoice.name : 'default'}${sysBoost() ? ', +10% speed & pitch' : ''})`
+    : engine === 'system' ? `built-in voices (${sysVoice ? sysVoice.name : 'default'}${sysBoost() ? ', +5% speed & pitch' : ''})`
     : `compact (processor, ${threads ? 'multi-core' : 'single-core'})`;
   const spd = engine !== 'system' && E.rtf ? ` · speed ${(1 / E.rtf).toFixed(1)}× real time${E.rtf > 0.9 ? ' (too slow: expect pauses)' : ''}` : '';
   $('mInfo').textContent = `Version ${VERSION} · voice engine: ${eng}${spd}`;
