@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.4';
+const VERSION = '1.4.1';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -750,7 +750,8 @@ function updateStatus() {
   $('status').textContent = s;
 }
 function onPlayState() {
-  $('icoPlay').hidden = E.playing; $('icoPause').hidden = !E.playing;
+  // SVG icons have no 'hidden' property: set the attribute itself
+  $('icoPlay').toggleAttribute('hidden', E.playing); $('icoPause').toggleAttribute('hidden', !E.playing);
   $('bPlay').setAttribute('aria-label', E.playing ? 'Pause' : 'Play');
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = E.playing ? 'playing' : 'paused';
   markActive();
