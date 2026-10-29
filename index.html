@@ -39,7 +39,7 @@
       <p>Listen to PDF and EPUB files, read aloud by natural AI voices that run right here on your device.</p>
       <button id="btnOpenBig" class="primary">Open a PDF or EPUB</button>
       <div id="recentBox" class="recent"></div>
-      <p id="voiceNote" class="note">On computers, the AI voices are downloaded the first time (about 330&nbsp;MB) and kept on the device. Wi-Fi recommended.</p>
+      <p id="voiceNote" class="note">The AI voices are downloaded the first time and kept on the device (about 330&nbsp;MB on computers, about 63&nbsp;MB per voice on iPhone/iPad). Wi-Fi recommended.</p>
     </div>
     <article id="text" class="text" hidden></article>
   </main>
@@ -104,11 +104,11 @@
       </section>
       <section>
         <h4>Voice engine</h4>
-        <div class="seg" id="segEngine">
-          <button data-v="auto">Automatic</button><button data-v="gpu">Fast</button><button data-v="cpu">Compact</button><button data-v="system">Built-in</button>
+        <div class="seg wrap" id="segEngine">
+          <button data-v="auto">Automatic</button><button data-v="gpu">Fast</button><button data-v="piper">Piper</button><button data-v="cpu">Compact</button><button data-v="system">Built-in</button>
         </div>
-        <p class="small" style="color:var(--muted);margin:4px 0 0"><b>Fast</b> runs the AI voices on the graphics chip: smooth on computers, about 330&nbsp;MB to download once, but too big for iPhone/iPad. <b>Compact</b> runs them on the processor: about 90&nbsp;MB, but pauses between sentences on most devices. <b>Built-in</b> uses the voices that come with this device: nothing to download and never pauses, but less natural. <b>Automatic</b> picks Built-in on iPhone/iPad and Fast on computers that support it.</p>
-        <p class="small" style="color:var(--muted);margin:6px 0 0">On iPhone/iPad: built-in voices are silent when the phone is in Silent mode, and Safari only offers the voices that come pre-installed (downloaded Enhanced/Premium voices are not available to web apps). Compact works in Silent mode and sounds natural, but may pause on slower phones.</p>
+        <p class="small" style="color:var(--muted);margin:4px 0 0"><b>Fast</b> runs the Kokoro AI voices on the graphics chip: smooth on computers, about 330&nbsp;MB to download once, but too big for iPhone/iPad. <b>Piper</b> uses lighter AI voices (about 63&nbsp;MB each, downloaded once): smooth on phones and tablets, slightly less expressive. <b>Compact</b> runs Kokoro on the processor: about 90&nbsp;MB, but pauses between sentences on most devices. <b>Built-in</b> uses the voices that come with this device: nothing to download, but less natural. <b>Automatic</b> picks Piper on iPhone/iPad and Fast on computers.</p>
+        <p class="small" style="color:var(--muted);margin:6px 0 0">On iPhone/iPad, built-in voices are silent in Silent mode and Safari offers only the pre-installed ones. Piper and Compact play in Silent mode. Piper voices: Lessac, Ryan, Jenny and Northern English male, from the open-source Piper project (rhasspy/piper-voices).</p>
       </section>
       <section>
         <h4>Speed</h4>

@@ -1,7 +1,7 @@
 // app.js - Narrator for the web (iPhone, iPad, Android, Mac, Windows).
 import { loadBook, chapterIndex, chunkWeight } from './doc.js';
 
-const VERSION = '1.2.5';
+const VERSION = '1.4';
 const SR = 24000;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 const VOICES = {
@@ -9,8 +9,8 @@ const VOICES = {
   'female-uk': ['bf_emma', 'Emma (British)'], 'male-uk': ['bm_george', 'George (British)'],
 };
 const KEEP_BEHIND = 8;
-let engine = '';   // 'gpu' (fast), 'cpu' (compact) or 'system' (the device's built-in voices), set when voices load
-const lookahead = () => engine === 'gpu' ? 6 : 14;  // read further ahead when synthesis is slow
+let engine = '';   // 'gpu' (fast), 'piper' (light), 'cpu' (compact) or 'system' (built-in voices), set when voices load
+const lookahead = () => engine === 'gpu' || engine === 'piper' ? 6 : 14;  // read further ahead when synthesis is slow
 const MOCK = new URLSearchParams(location.search).has('mock');   // testing without the voice model
 // iPhone / iPad (iPadOS reports itself as a Mac, but has a touch screen)
 const APPLE_MOBILE = /iPhone|iPad|iPod/.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
@@ -51,8 +51,14 @@ const fmt = s => {
   return h ? `${h}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}` : `${m}:${String(x).padStart(2, '0')}`;
 };
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const voiceId = () => VOICES[`${S.gender}-${S.accent}`][0];
-const voiceLabel = () => VOICES[`${S.gender}-${S.accent}`][1];
+// Piper voices (light AI voices, about 63 MB each) used on iPhone/iPad
+const PIPER_VOICES = {
+  'female-us': ['en_US-lessac-medium', 'Lessac (American)'], 'male-us': ['en_US-ryan-medium', 'Ryan (American)'],
+  'female-uk': ['en_GB-jenny_dioco-medium', 'Jenny (British)'], 'male-uk': ['en_GB-northern_english_male-medium', 'Northern English male (British)'],
+};
+const voiceFor = eng => (eng === 'piper' ? PIPER_VOICES : VOICES)[`${S.gender}-${S.accent}`];
+const voiceId = () => voiceFor(engine)[0];
+const voiceLabel = () => voiceFor(engine)[1];
 const speedLabel = s => `${s}×`;
 let flashMsg = '', flashUntil = 0;
 const flash = (msg, ms = 3500) => { flashMsg = msg; flashUntil = Date.now() + ms; updateStatus(); };
@@ -94,14 +100,16 @@ let worker, ttsReady = false, ttsError = null, dl = { loaded: 0, total: 0 }, thr
 
 // Which engine to start. On iPhone/iPad the AI voice engines are too heavy for the browser
 // (the fast one runs out of memory, the compact one is slower than speech), so Automatic
-// uses the device's own voices there.
+// uses the light Piper voices there; computers keep the fast engine.
 function resolveEngine() {
   const v = S.engine;
   if (v === 'system') return HAS_SPEECH ? 'system' : 'cpu';
-  if (v === 'gpu') return 'gpu';
-  if (v === 'cpu') return 'cpu';
-  if (APPLE_MOBILE) return HAS_SPEECH ? 'system' : 'cpu';
-  if (localStorage.getItem('narrator.gpuFailed') === '1') return 'cpu';
+  if (v === 'gpu' || v === 'cpu' || v === 'piper') return v;
+  if (APPLE_MOBILE) {
+    if (localStorage.getItem('narrator.piperFailed') === '1') return HAS_SPEECH ? 'system' : 'cpu';
+    return 'piper';
+  }
+  if (localStorage.getItem('narrator.gpuFailed') === '1') return 'piper';
   return 'auto';                       // the worker picks gpu when available, otherwise cpu
 }
 
@@ -116,11 +124,14 @@ let crashNote = '';
   if (died === 'gpu') {
     localStorage.setItem('narrator.gpuFailed', '1');
     if (S.engine === 'gpu') { S.engine = 'auto'; saveSettings(); }
+  } else if (died === 'piper') {
+    localStorage.setItem('narrator.piperFailed', '1');
+    if (S.engine === 'piper') { S.engine = 'auto'; saveSettings(); }
   } else if (died === 'cpu' && APPLE_MOBILE && HAS_SPEECH && S.engine === 'cpu') { S.engine = 'system'; saveSettings(); }
   else return;
   crashNote = died === 'gpu'
     ? 'The fast voice engine ran out of memory last time, so a lighter engine is used now.'
-    : 'The compact voice engine ran out of memory last time, so the built-in voices are used now.';
+    : `The ${died === 'piper' ? 'Piper' : 'compact'} voice engine stopped the app last time, so another engine is used now.`;
 })();
 
 function startWorker() {
@@ -143,11 +154,11 @@ function startWorker() {
       },
     };
   } else {
-    worker = new Worker(new URL('./tts-worker.js', import.meta.url), { type: 'module' });
+    worker = new Worker(new URL(r === 'piper' ? './piper-worker.js' : './tts-worker.js', import.meta.url), { type: 'module' });
     worker.onmessage = onWorker;
     worker.onerror = e => { ttsError = e.message || 'The voice engine could not start.'; updateStatus(); };
   }
-  worker.postMessage({ type: 'load', engine: r });
+  worker.postMessage({ type: 'load', engine: r, voice: voiceFor(r)[0] });
 }
 function onWorker(e) {
   const m = e.data;
@@ -384,7 +395,7 @@ function startSource() {
   }
   const a = E.cache.get(ckey(E.cur));
   const n = E.book.chunks.length;
-  const needNext = E.preroll && engine !== 'gpu' && E.cur + 1 < n && !E.cache.has(ckey(E.cur + 1));
+  const needNext = E.preroll && engine === 'cpu' && E.cur + 1 < n && !E.cache.has(ckey(E.cur + 1));
   if (!a || needNext) { E.buffering = true; pump(); updateStatus(); return; }
   E.buffering = false; E.preroll = false;
   E.dur = a.length / SR;
@@ -884,6 +895,7 @@ function setEngine(v) {
   if (S.engine === v) return;
   S.engine = v; saveSettings(); syncControls();
   if (v === 'gpu') localStorage.removeItem('narrator.gpuFailed');   // chosen on purpose: allow another try
+  if (v === 'piper') localStorage.removeItem('narrator.piperFailed');
   const wasPlaying = E.playing;
   if (E.playing) pause();
   if (engine === 'system') sysStop();
@@ -892,7 +904,7 @@ function setEngine(v) {
   ttsReady = false; ttsError = null; engine = ''; dl = { loaded: 0, total: 0 }; dlCached = false;
   E.cache.clear(); E.inflight = null; E.gen++;
   startWorker();
-  flash(v === 'cpu' ? 'Switching to the compact voice engine…' : v === 'system' ? 'Switching to the built-in voices…' : 'Switching voice engine…');
+  flash(v === 'cpu' ? 'Switching to the compact voice engine…' : v === 'piper' ? 'Switching to the Piper voices…' : v === 'system' ? 'Switching to the built-in voices…' : 'Switching voice engine…');
   if (v === 'gpu' && APPLE_MOBILE) setTimeout(() => flash('Fast may run out of memory on iPhone/iPad. If the app restarts, it switches back by itself.', 7000), 3600);
   if (wasPlaying) { const t = setInterval(() => { if (ttsReady) { clearInterval(t); play(); } }, 300); }
 }
@@ -905,6 +917,7 @@ $('mReset').onclick = async () => {
 };
 function updateInfo() {
   const eng = !ttsReady ? 'loading' : engine === 'gpu' ? 'fast (graphics chip)'
+    : engine === 'piper' ? `Piper light voices (${voiceLabel()})`
     : engine === 'system' ? `built-in voices (${sysVoice ? sysVoice.name : 'default'}${sysBoost() ? ', +5% speed & pitch' : ''})`
     : `compact (processor, ${threads ? 'multi-core' : 'single-core'})`;
   const spd = engine !== 'system' && E.rtf ? ` · speed ${(1 / E.rtf).toFixed(1)}× real time${E.rtf > 0.9 ? ' (too slow: expect pauses)' : ''}` : '';
